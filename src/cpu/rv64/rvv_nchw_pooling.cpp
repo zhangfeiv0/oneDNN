@@ -1,6 +1,6 @@
 /******************************************************************************
-* Copyright 2023 Intel Corporation
-* Copyright 2023 KNS Group LLC (YADRO)
+* Copyright 2023-2025 Intel Corporation
+* Copyright 2023-2025 KNS Group LLC (YADRO)
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include "rvv_nchw_pooling.hpp"
 #include <algorithm>
-#include "common/dnnl_thread.hpp"
 #include <riscv_vector.h>
+
+#include "common/dnnl_thread.hpp"
+#include "cpu/rv64/rvv_nchw_pooling.hpp"
 
 namespace dnnl {
 namespace impl {
