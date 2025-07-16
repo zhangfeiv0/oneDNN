@@ -538,7 +538,7 @@ std::ostream &operator<<(std::ostream &s, const deserialized_lt_t &dlt) {
 }
 
 std::string deserialized_lt_t::get_string() const {
-    std::stringstream ss;
+    dnnl::impl::stringstream_t ss;
     ss << *this;
     return ss.str();
 }
@@ -608,7 +608,7 @@ std::ostream &operator<<(std::ostream &s, const deserialized_op_t &dop) {
 }
 
 std::string deserialized_op_t::get_string() const {
-    std::stringstream ss;
+    dnnl::impl::stringstream_t ss;
     ss << *this;
     return ss.str();
 }
@@ -621,7 +621,7 @@ std::ostream &operator<<(std::ostream &s, const deserialized_graph_t &dg) {
 }
 
 std::string deserialized_graph_t::get_string() const {
-    std::stringstream ss;
+    dnnl::impl::stringstream_t ss;
     ss << *this;
     return ss.str();
 }
