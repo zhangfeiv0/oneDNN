@@ -345,12 +345,11 @@ void getting_started_tutorial(engine::kind engine_kind) {
     // [Create a ReLU primitive]
 
     /// A note about variable names. Similar to the `_md` suffix used for
-    /// memory descriptor, we use `_d` for the operation descriptor names,
-    /// `_pd` for the primitive descriptors, and no suffix for primitives
-    /// themselves.
+    /// memory descriptors, we use `_pd` for the primitive descriptors,
+    /// and no suffix for primitives themselves.
     ///
     /// It is worth mentioning that we specified the exact tensor and its
-    /// memory format when we were initializing the `relu_d`. That means
+    /// memory format when we were initializing the `relu_pd`. That means
     /// `relu` primitive would perform computations with memory objects that
     /// correspond to this description. This is the one and only one way of
     /// creating non-compute-intensive primitives like @ref dev_guide_eltwise,
