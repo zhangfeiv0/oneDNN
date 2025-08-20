@@ -39,10 +39,8 @@ struct riscv_nchw_pooling_fwd_t : public primitive_t {
             const format_tag_t desired_fmt_tag = utils::pick(ndims() - 3,
                     format_tag::ncw, format_tag::nchw, format_tag::ncdhw);
 
-            const bool is_training
-                    = desc_.prop_kind == prop_kind::forward_training;
-
-            VDISPATCH_POOLING(is_fwd(), VERBOSE_BAD_PROPKIND);
+            VDISPATCH_POOLING(desc_.prop_kind == prop_kind::forward_inference,
+                    VERBOSE_BAD_PROPKIND);
             VDISPATCH_POOLING(
                     utils::one_of(desc()->alg_kind, alg_kind::pooling_max,
                             alg_kind::pooling_avg_include_padding,
@@ -71,8 +69,6 @@ struct riscv_nchw_pooling_fwd_t : public primitive_t {
             VDISPATCH_POOLING(
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
-            VDISPATCH_POOLING(!is_training, VERBOSE_BAD_PROPKIND,
-                    "does not support training");
             VDISPATCH_POOLING(
                     KW() < riscv_nchw_pooling_fwd_t<d_type>::max_kernel_width,
                     VERBOSE_UNSUPPORTED_FEATURE,
