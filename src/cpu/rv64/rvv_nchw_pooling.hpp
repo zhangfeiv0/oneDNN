@@ -42,25 +42,41 @@ struct riscv_nchw_pooling_fwd_t : public primitive_t {
             const bool is_training
                     = desc_.prop_kind == prop_kind::forward_training;
 
-            const bool ok = is_fwd()
-                    && utils::one_of(desc()->alg_kind, alg_kind::pooling_max,
+            VDISPATCH_POOLING(is_fwd(), VERBOSE_BAD_PROPKIND);
+            VDISPATCH_POOLING(
+                    utils::one_of(desc()->alg_kind, alg_kind::pooling_max,
                             alg_kind::pooling_avg_include_padding,
-                            alg_kind::pooling_avg_exclude_padding)
-                    && set_default_params() == status::success
-                    && memory_desc_wrapper(dst_md()).is_dense(false)
-                    && utils::everyone_is(
-                            d_type, src_md()->data_type, dst_md()->data_type)
-                    && platform::has_data_type_support(d_type)
-                    && !has_zero_dim_memory() && !is_dilated()
-                    && attr()->has_default_values()
-                    && memory_desc_matches_tag(*src_md(), desired_fmt_tag)
-                    && memory_desc_matches_tag(*dst_md(), desired_fmt_tag)
-                    && attr_.set_default_formats(dst_md(0)) == status::success
-                    && !is_training
-                    && KW() < riscv_nchw_pooling_fwd_t<
-                               d_type>::max_kernel_width;
-
-            if (!ok) return status::unimplemented;
+                            alg_kind::pooling_avg_exclude_padding),
+                    VERBOSE_BAD_ALGORITHM);
+            VDISPATCH_POOLING(set_default_params() == status::success,
+                    VERBOSE_UNSUPPORTED_TAG);
+            VDISPATCH_POOLING(memory_desc_wrapper(dst_md()).is_dense(false),
+                    VERBOSE_UNSUPPORTED_SPARSE_CFG);
+            VDISPATCH_POOLING(utils::everyone_is(d_type, src_md()->data_type,
+                                      dst_md()->data_type),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_POOLING(platform::has_data_type_support(d_type),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_POOLING(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+            VDISPATCH_POOLING(!is_dilated(), VERBOSE_UNSUPPORTED_FEATURE,
+                    "does not support dilations");
+            VDISPATCH_POOLING(
+                    attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
+            VDISPATCH_POOLING(
+                    memory_desc_matches_tag(*src_md(), desired_fmt_tag),
+                    VERBOSE_UNSUPPORTED_TAG_S, "src");
+            VDISPATCH_POOLING(
+                    memory_desc_matches_tag(*dst_md(), desired_fmt_tag),
+                    VERBOSE_UNSUPPORTED_TAG_S, "dst");
+            VDISPATCH_POOLING(
+                    attr_.set_default_formats(dst_md(0)) == status::success,
+                    VERBOSE_UNSUPPORTED_POSTOP);
+            VDISPATCH_POOLING(!is_training, VERBOSE_UNSUPPORTED_FEATURE,
+                    "does not support training");
+            VDISPATCH_POOLING(
+                    KW() < riscv_nchw_pooling_fwd_t<d_type>::max_kernel_width,
+                    VERBOSE_UNSUPPORTED_FEATURE,
+                    "kernel width exceeds maximum");
 
             return status::success;
         }
