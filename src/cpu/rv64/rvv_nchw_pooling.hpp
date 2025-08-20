@@ -71,7 +71,7 @@ struct riscv_nchw_pooling_fwd_t : public primitive_t {
             VDISPATCH_POOLING(
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
-            VDISPATCH_POOLING(!is_training, VERBOSE_UNSUPPORTED_FEATURE,
+            VDISPATCH_POOLING(!is_training, VERBOSE_BAD_PROPKIND,
                     "does not support training");
             VDISPATCH_POOLING(
                     KW() < riscv_nchw_pooling_fwd_t<d_type>::max_kernel_width,
