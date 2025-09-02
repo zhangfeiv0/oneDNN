@@ -73,6 +73,7 @@ status_t pd_t::init_post_ops() {
                                 &e.binary.src1_desc);
                 binary_srcs_.push_back(
                         binary_src_t {binary_src_t::binary, int(i)});
+                non_scale_po_ = true;
                 break;
             case sum:
                 ok &= !with_sum_;
@@ -84,6 +85,7 @@ status_t pd_t::init_post_ops() {
             case eltwise:
                 ok &= eltwise_injector_f32_is_supported(e.eltwise.alg);
                 binary_srcs_.push_back(binary_src_t {binary_src_t::none, 0});
+                non_scale_po_ = true;
                 break;
             case prelu:
                 binary_srcs_.push_back(
@@ -93,10 +95,10 @@ status_t pd_t::init_post_ops() {
                         == status::success;
                 prelu_count++;
                 ok &= prelu_count <= 1;
+                non_scale_po_ = true;
                 break;
             default: return status::unimplemented;
         }
-        non_scale_po_ = true;
     }
 
     if (!ok) return status::unimplemented;
