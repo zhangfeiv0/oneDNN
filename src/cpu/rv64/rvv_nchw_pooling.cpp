@@ -54,7 +54,11 @@ void MaxPooling(const float *src, float *dst, const dim_t batch,
                 int iw_end = std::min(ow_offset + kerW, inW);
 
                 if (iw_start >= iw_end) {
-                    dst[dst_offset] = -__FLT_MAX__;
+                    size_t one = __riscv_vsetvl_e32m1(1);
+                    vfloat32m1_t vneg_inf
+                            = __riscv_vfmv_v_f_f32m1(-__FLT_MAX__, one);
+                    vfloat32m1_t vout = postops_handler.apply(vneg_inf, one);
+                    __riscv_vse32_v_f32m1(&dst[dst_offset], vout, 1);
                     return;
                 }
 
