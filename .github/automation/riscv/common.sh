@@ -1,7 +1,9 @@
 #! /bin/bash
 
 # *******************************************************************************
+# Copyright 2024-2025 Arm Limited and affiliates.
 # Copyright 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +35,7 @@ if [[ "$BUILD_TOOLSET" == "gcc" ]]; then
     export CC=riscv64-linux-gnu-gcc-${GCC_VERSION}
     export CXX=riscv64-linux-gnu-g++-${GCC_VERSION}
 fi
-export CMAKE_TOOLCHAIN_FILE="$(dirname "$(readlink -f "$0")")/../../../cmake/riscv64-toolchain.cmake"
+export CMAKE_TOOLCHAIN_FILE="$(dirname "$(readlink -f "$0")")/../../../cmake/toolchains/riscv64.cmake"
 
 # Print every exported variable.
 echo "Cross-compilation mode for RISC-V"
