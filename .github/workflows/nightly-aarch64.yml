@@ -32,13 +32,15 @@ concurrency:
   cancel-in-progress: true
 
 # Declare default permissions as read only.
-permissions: write-all
+permissions: read-all
 
 jobs:
   build-acl-cache:
     uses: ./.github/workflows/aarch64-acl.yml
 
   test-performance:
+    permissions:
+      contents: write
     uses: ./.github/workflows/performance-aarch64.yml
 
   build-and-test:
@@ -52,6 +54,8 @@ jobs:
 
     name: ${{ matrix.config.name }}, ${{ matrix.config.toolset }}, ${{ matrix.config.threading }}, ${{ matrix.config.build }}
     runs-on: ${{ matrix.config.label }}
+    permissions:
+      contents: write
     steps:
 
       - name: Checkout oneDNN

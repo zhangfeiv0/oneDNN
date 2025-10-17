@@ -28,8 +28,9 @@ on:
 
   workflow_dispatch:
 
-# Declare default permissions as read only.
-permissions: read-all
+permissions:
+  contents: read
+  id-token: none
 
 jobs:
   # Cache is built sequentially to avoid cache-hit race conditions
