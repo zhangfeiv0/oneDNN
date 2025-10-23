@@ -59,6 +59,9 @@ struct rvv_matmul_t : public primitive_t {
             VDISPATCH_MATMUL(attr()->scales_.has_default_values(),
                     VERBOSE_UNSUPPORTED_SCALES_CFG);
 
+            VDISPATCH_MATMUL(attr()->dropout_.has_default_values(),
+                    VERBOSE_UNSUPPORTED_ATTR);
+
             VDISPATCH_MATMUL(rvv_postops_t::post_ops_ok(attr()->post_ops_),
                     VERBOSE_UNSUPPORTED_POSTOP);
 
