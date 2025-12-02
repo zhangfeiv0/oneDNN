@@ -28,7 +28,7 @@
 #define NGEN_NO_OP_NAMES
 #define NGEN_WINDOWS_COMPAT
 
-#ifdef DNNL_DEV_MODE
+#if !defined(NDEBUG) || defined(DNNL_DEV_MODE)
 #define NGEN_ASM
 #endif
 
