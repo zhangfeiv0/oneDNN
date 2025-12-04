@@ -270,12 +270,12 @@ static_params_t::static_params_t(const Xbyak::Reg64 &param1,
         const bcast_set_t &supported_strategy_set,
         const rhs_arg_static_params_t &rhs_arg_static_params)
     : static_params_t(param1, supported_strategy_set, rhs_arg_static_params,
-            nullptr, nullptr) {}
+              nullptr, nullptr) {}
 
 static_params_t::static_params_t(const Xbyak::Reg64 &param1,
         const rhs_arg_static_params_t &rhs_arg_static_params)
     : static_params_t(param1, get_all_strategies_supported_by_injector(),
-            rhs_arg_static_params) {}
+              rhs_arg_static_params) {}
 
 rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t rhs_dt_helper_vmm_idx, const Xbyak::Reg64 &rhs_addr_reg,
@@ -285,10 +285,10 @@ rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t dst_orig_offset, const memory_desc_wrapper &dst_d,
         std::size_t tail_size, bool use_exact_tail_scalar_bcast)
     : rhs_arg_static_params_t(rhs_dt_helper_vmm_idx, rhs_addr_reg,
-            rhs_helper_reg, rhs_addr_cache_reg, preserve_gpr_helpers,
-            preserve_vmm_helper, abi_param_offset, dst_orig_offset, dst_d,
-            tail_size, Xbyak::Opmask(2), use_exact_tail_scalar_bcast,
-            rhs_helper_reg, false /*is_opmask_set*/) {}
+              rhs_helper_reg, rhs_addr_cache_reg, preserve_gpr_helpers,
+              preserve_vmm_helper, abi_param_offset, dst_orig_offset, dst_d,
+              tail_size, Xbyak::Opmask(2), use_exact_tail_scalar_bcast,
+              rhs_helper_reg, false /*is_opmask_set*/) {}
 
 rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t rhs_dt_helper_vmm_idx, const Xbyak::Reg64 &rhs_addr_reg,
@@ -299,10 +299,10 @@ rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t tail_size, const Xbyak::Opmask &tail_opmask,
         bool use_exact_tail_scalar_bcast)
     : rhs_arg_static_params_t(rhs_dt_helper_vmm_idx, rhs_addr_reg,
-            rhs_helper_reg, rhs_addr_cache_reg, preserve_gpr_helpers,
-            preserve_vmm_helper, abi_param_offset, dst_orig_offset, dst_d,
-            tail_size, tail_opmask, use_exact_tail_scalar_bcast, rhs_helper_reg,
-            true /*is_opmask_set*/) {}
+              rhs_helper_reg, rhs_addr_cache_reg, preserve_gpr_helpers,
+              preserve_vmm_helper, abi_param_offset, dst_orig_offset, dst_d,
+              tail_size, tail_opmask, use_exact_tail_scalar_bcast,
+              rhs_helper_reg, true /*is_opmask_set*/) {}
 
 rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t rhs_dt_helper_vmm_idx, const Xbyak::Reg64 &rhs_addr_reg,
@@ -313,10 +313,10 @@ rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t tail_size, const Xbyak::Opmask &tail_opmask,
         const Xbyak::Reg64 &reg_tail_size, bool use_exact_tail_scalar_bcast)
     : rhs_arg_static_params_t(rhs_dt_helper_vmm_idx, rhs_addr_reg,
-            rhs_helper_reg, rhs_addr_cache_reg, preserve_gpr_helpers,
-            preserve_vmm_helper, abi_param_offset, dst_orig_offset, dst_d,
-            tail_size, tail_opmask, use_exact_tail_scalar_bcast, reg_tail_size,
-            true /*is_opmask_set*/) {}
+              rhs_helper_reg, rhs_addr_cache_reg, preserve_gpr_helpers,
+              preserve_vmm_helper, abi_param_offset, dst_orig_offset, dst_d,
+              tail_size, tail_opmask, use_exact_tail_scalar_bcast,
+              reg_tail_size, true /*is_opmask_set*/) {}
 
 rhs_arg_static_params_t::rhs_arg_static_params_t(
         std::size_t rhs_dt_helper_vmm_idx, const Xbyak::Reg64 &rhs_addr_reg,
@@ -537,48 +537,52 @@ void jit_uni_binary_injector_t<isa, Vmm>::compute_vector_range(
     const injector_utils::register_preserve_guard_t register_guard {host_,
             (rhs_arg_static_params_.preserve_gpr_helpers
                                     && should_preserve_w_or_oc_offset_conversion_regs
-                            ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_reg,
-                                            rhs_arg_static_params_
-                                                    .rhs_helper_reg,
-                                            rhs_arg_static_params_
-                                                    .rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx, host_->r8})
+                            ? std::initializer_list<
+                                      Xbyak::Reg64>({rhs_arg_static_params_
+                                                             .rhs_addr_reg,
+                                      rhs_arg_static_params_.rhs_helper_reg,
+                                      rhs_arg_static_params_.rhs_addr_cache_reg,
+                                      host_->rax, host_->rdx, host_->r8})
                             : rhs_arg_static_params_.preserve_gpr_helpers
                                     && should_preserve_mb_sp_offset_conversion_regs
                             ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_reg,
-                                            rhs_arg_static_params_
-                                                    .rhs_helper_reg,
-                                            rhs_arg_static_params_
-                                                    .rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx, host_->r8,
-                                            host_->r9})
+                                      {rhs_arg_static_params_.rhs_addr_reg,
+                                              rhs_arg_static_params_
+                                                      .rhs_helper_reg,
+                                              rhs_arg_static_params_
+                                                      .rhs_addr_cache_reg,
+                                              host_->rax, host_->rdx, host_->r8,
+                                              host_->r9})
                             : rhs_arg_static_params_.preserve_gpr_helpers
                             ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_reg,
-                                            rhs_arg_static_params_
-                                                    .rhs_helper_reg,
-                                            rhs_arg_static_params_
-                                                    .rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx})
+                                      {rhs_arg_static_params_.rhs_addr_reg,
+                                              rhs_arg_static_params_
+                                                      .rhs_helper_reg,
+                                              rhs_arg_static_params_
+                                                      .rhs_addr_cache_reg,
+                                              host_->rax, host_->rdx})
                             : should_preserve_w_or_oc_offset_conversion_regs
                             ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx, host_->r8})
+                                      {rhs_arg_static_params_
+                                                      .rhs_addr_cache_reg,
+                                              host_->rax, host_->rdx,
+                                              host_->r8})
                             : shoud_preserve_oc_d_offset_conversion_regs
                             ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx})
+                                      {rhs_arg_static_params_
+                                                      .rhs_addr_cache_reg,
+                                              host_->rax, host_->rdx})
                             : should_preserve_mb_sp_offset_conversion_regs
                             ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx, host_->r8,
-                                            host_->r9})
+                                      {rhs_arg_static_params_
+                                                      .rhs_addr_cache_reg,
+                                              host_->rax, host_->rdx, host_->r8,
+                                              host_->r9})
                             : use_offset_conversions
                             ? std::initializer_list<Xbyak::Reg64>(
-                                    {rhs_arg_static_params_.rhs_addr_cache_reg,
-                                            host_->rax, host_->rdx})
+                                      {rhs_arg_static_params_
+                                                      .rhs_addr_cache_reg,
+                                              host_->rax, host_->rdx})
                             : std::initializer_list<Xbyak::Reg64>()),
             (rhs_arg_static_params_.preserve_vmm_helper && dt_helper_vmm_needed
                             ? std::initializer_list<Xbyak::Xmm>({Vmm(vmm_hint)})
@@ -891,9 +895,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_oc_offset(
             const auto r8 = host_->r8;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx, r8)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx, r8)
+                                    : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
 
@@ -1119,9 +1124,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_oc_d_offset(
             const auto rdx = host_->rdx;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx)
+                                    : false,
                             host_, {it_out_reg->second}};
 
             switch (layout) {
@@ -1242,7 +1248,7 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_mb_sp_offset(
             const injector_utils::conditional_register_preserve_guard_t
                     register_guard {is_out_reg
                                     ? utils::one_of(it_out_reg->second, rax,
-                                            rdx, r8, r9)
+                                              rdx, r8, r9)
                                     : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
@@ -1524,7 +1530,7 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_mb_w_offset(
             const injector_utils::conditional_register_preserve_guard_t
                     register_guard {is_out_reg
                                     ? utils::one_of(it_out_reg->second, rax,
-                                            rdx, r8, r9)
+                                              rdx, r8, r9)
                                     : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
@@ -1832,9 +1838,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_hw_offset(
             const auto r8 = host_->r8;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx, r8)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx, r8)
+                                    : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
 
@@ -1965,9 +1972,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_w_offset(
             const auto r8 = host_->r8;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx, r8)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx, r8)
+                                    : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
 
@@ -2174,9 +2182,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_mb_offset(
             const auto r8 = host_->r8;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx, r8)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx, r8)
+                                    : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
 
@@ -2350,9 +2359,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_oc_spatial_offset(
             const auto r8 = host_->r8;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx, r8)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx, r8)
+                                    : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
 
@@ -2520,9 +2530,10 @@ void jit_uni_binary_injector_t<isa, Vmm>::append_mb_oc_offset(
             const auto r8 = host_->r8;
 
             const injector_utils::conditional_register_preserve_guard_t
-                    register_guard {is_out_reg ? utils::one_of(
-                                            it_out_reg->second, rax, rdx, r8)
-                                               : false,
+                    register_guard {is_out_reg
+                                    ? utils::one_of(
+                                              it_out_reg->second, rax, rdx, r8)
+                                    : false,
                             host_,
                             {is_out_reg ? it_out_reg->second : Xbyak::Reg64()}};
 
