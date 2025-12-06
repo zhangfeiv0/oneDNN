@@ -866,7 +866,11 @@ float compute_blocking_heuristic_avx512(brgemm_matmul_conf_t &bgmmc,
         matmul_avx512_blocking_params_t &best_blocking) {
     const int nthr = bgmmc.nthr;
 
-    const int max_m_blk = nstl::min(256, matmul.M);
+    const bool need_large_m_blk = bgmmc.ndims == 2 && bm_conf_utils.is_f32()
+            && bgmmc.N <= 14528
+            && ((bgmmc.M <= 768 && bgmmc.K <= 128)
+                    || bgmmc.K * bgmmc.M <= 49152);
+    const int max_m_blk = nstl::min(need_large_m_blk ? 512 : 256, matmul.M);
     int min_m_blk = nstl::min(32, matmul.M);
 
     dim_t min_m_chunks = div_up(matmul.M, max_m_blk);
@@ -1842,7 +1846,7 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
             && is_superset(bgmmc.isa, avx512_core)) {
         // Dispatch the shapes with small K to gemm for better performance
         // The heuristic values are empirical
-        const bool small_K = bgmmc.N <= 14528
+        const bool small_K = bgmmc.N <= 14528 && bgmmc.K == 32
                 && ((bgmmc.M <= 768 && bgmmc.K <= 128)
                         || bgmmc.K * bgmmc.M <= 49152);
         // We need to exclude certain shapes as brgemm matmul performs better
