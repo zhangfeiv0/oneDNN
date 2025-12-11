@@ -22,10 +22,10 @@ name: "Weekly RISC-V"
 #* https://github.com/orgs/community/discussions/26940#discussioncomment-5686753
 on:
   push:
-    branches: [main, "rls-*", ci_support]
+    branches: [main, ci_support, "rls-*"]
     paths:
       - ".github/automation/riscv/**"
-      - ".github/workflows/ci-riscv.yml"
+      - ".github/workflows/weekly-riscv.yml"
       - "cmake/**"
       - "examples/**"
       - "include/**"
@@ -38,7 +38,7 @@ on:
      types: [opened, synchronize, reopened]
      paths:
       - ".github/automation/riscv/**"
-      - ".github/workflows/ci-riscv.yml"
+      - ".github/workflows/weekly-riscv.yml"
       - "cmake/**"
       - "examples/**"
       - "include/**"
