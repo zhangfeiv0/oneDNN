@@ -64,7 +64,7 @@ jobs:
     strategy:
       matrix:
         config: [
-          { name: riscv-build, label: ubuntu-24.04, threading: OMP, toolset: gcc, build: RelWithAssert, testset: SMOKE }
+          { name: riscv-build, label: ubuntu-24.04, threading: OMP, toolset: gcc, build: RelWithAssert, testset: CI }
         ]
 
     name: ${{ matrix.config.name }}, ${{ matrix.config.toolset }}, ${{ matrix.config.threading }}, ${{ matrix.config.build }}
@@ -122,7 +122,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
-          name: build-artifact
+          name: build-artifact-weekly
           path: |
             ${{ github.workspace }}/oneDNN/build.tar.gz
           retention-days: 1
@@ -133,8 +133,8 @@ jobs:
       matrix:
         config: [
           # Test with different vector lengths and threading modes
-          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert },
-          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert }
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert }
         ]
 
     name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}
@@ -168,7 +168,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: build-artifact
+          name: build-artifact-weekly
           path: ${{ github.workspace }}/oneDNN/
 
       - name: Extract archive
