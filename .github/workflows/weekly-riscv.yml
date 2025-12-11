@@ -16,7 +16,7 @@
 # limitations under the License.
 # *******************************************************************************
 
-name: "CI RISC-V"
+name: "Weekly RISC-V"
 
 #* To avoid duplicate jobs running when both push and PR is satisfied, we use this:
 #* https://github.com/orgs/community/discussions/26940#discussioncomment-5686753
