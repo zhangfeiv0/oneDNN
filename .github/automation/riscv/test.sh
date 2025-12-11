@@ -39,7 +39,7 @@ elif [[ "$ONEDNN_TEST_SET" == "CI" ]]; then
     set +x
 
 else
-    echo "Unknown action: $ONEDNN_ACTION"
+    echo "Unknown Test Set: $ONEDNN_TEST_SET"
     exit 1
 fi
 
