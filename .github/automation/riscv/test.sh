@@ -35,7 +35,9 @@ if [[ "$ONEDNN_TEST_SET" == "SMOKE" ]]; then
 
 elif [[ "$ONEDNN_TEST_SET" == "CI" ]]; then
     set -x
-    ctest --no-tests=error --output-on-failure
+    part=${ONEDNN_TEST_PART:-1}
+    total=${ONEDNN_TEST_PART_TOTAL:-1}
+    ctest --no-tests=error --output-on-failure -I ${part},,${total}
     set +x
 
 else

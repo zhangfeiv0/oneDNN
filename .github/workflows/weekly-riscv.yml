@@ -133,8 +133,10 @@ jobs:
       matrix:
         config: [
           # Test with different vector lengths and threading modes
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert },
-          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert }
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 1, total_parts: 2 },
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 2, total_parts: 2 },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 1, total_parts: 2 },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 2, total_parts: 2 }
         ]
 
     name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}
@@ -183,6 +185,8 @@ jobs:
           CTEST_PARALLEL_LEVEL: 4
           ONEDNN_THREADING: ${{ matrix.config.threading }}
           ONEDNN_TEST_SET: ${{ matrix.config.testset }}
+          ONEDNN_TEST_PART: ${{ matrix.config.part }}
+          ONEDNN_TEST_PART_TOTAL: ${{ matrix.config.total_parts }}
           QEMU_CPU: "rv64,v=true,vlen=${{ matrix.config.vlen }},vext_spec=v1.0"
 
   # This job adds a check named "CI RISC-V" that represents overall
