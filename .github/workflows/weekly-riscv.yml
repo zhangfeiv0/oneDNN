@@ -133,13 +133,17 @@ jobs:
       matrix:
         config: [
           # Test with different vector lengths and threading modes
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 1, total_parts: 2 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 2, total_parts: 2 },
-          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 1, total_parts: 2 },
-          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 2, total_parts: 2 }
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 1, stride: 4 },
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 2, stride: 4 },
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 3, stride: 4 },
+          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 4, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 1, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 2, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 3, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: CI, vlen: 256, build: RelWithAssert, part: 4, stride: 4 }
         ]
 
-    name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}
+    name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}, part-${{ matrix.config.part }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout oneDNN
@@ -186,7 +190,7 @@ jobs:
           ONEDNN_THREADING: ${{ matrix.config.threading }}
           ONEDNN_TEST_SET: ${{ matrix.config.testset }}
           ONEDNN_TEST_PART: ${{ matrix.config.part }}
-          ONEDNN_TEST_PART_TOTAL: ${{ matrix.config.total_parts }}
+          ONEDNN_TEST_STRIDE: ${{ matrix.config.stride }}
           QEMU_CPU: "rv64,v=true,vlen=${{ matrix.config.vlen }},vext_spec=v1.0"
 
   # This job adds a check named "CI RISC-V" that represents overall
@@ -194,7 +198,7 @@ jobs:
   status:
     needs: [build, test]
     runs-on: ubuntu-24.04
-    name: "CI RISC-V"
+    name: "Weekly RISC-V"
     steps:
       - name: Print success
         run: echo Success

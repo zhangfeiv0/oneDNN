@@ -133,11 +133,17 @@ jobs:
       matrix:
         config: [
           # Test with different vector lengths and threading modes
-          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert },
-          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert }
+          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert, part: 1, stride: 4 },
+          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert, part: 2, stride: 4 },
+          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert, part: 3, stride: 4 },
+          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert, part: 4, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert, part: 1, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert, part: 2, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert, part: 3, stride: 4 },
+          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert, part: 4, stride: 4 }
         ]
 
-    name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}
+    name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}, part-${{ matrix.config.part }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout oneDNN
@@ -183,6 +189,8 @@ jobs:
           CTEST_PARALLEL_LEVEL: 4
           ONEDNN_THREADING: ${{ matrix.config.threading }}
           ONEDNN_TESTSET: ${{ matrix.config.testset }}
+          ONEDNN_TEST_PART: ${{ matrix.config.part }}
+          ONEDNN_TEST_STRIDE: ${{ matrix.config.stride }}
           QEMU_CPU: "rv64,v=true,vlen=${{ matrix.config.vlen }},vext_spec=v1.0"
 
   # This job adds a check named "CI RISC-V" that represents overall
