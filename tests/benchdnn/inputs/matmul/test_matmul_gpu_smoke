@@ -134,7 +134,7 @@
 --reset
 --dt=f8_e5m2:s4:f8_e5m2,f8_e4m3:u4:f8_e4m3
 --stag=abc
---attr-scales=wei:per_ocic:f8_e5m2:32x1+src:per_oc:f32:1x32,\
+--attr-scales=wei:per_ocic:f8_e4m3:32x1+src:per_oc:f32:1x32,\
               wei:per_ocic:f8_e4m3:32x1+src:common:2:f32,\
               wei:per_ocic:f32:32x1+src:common:2:f32
 --attr-zero-points=wei:per_ocic:s4:32x1
