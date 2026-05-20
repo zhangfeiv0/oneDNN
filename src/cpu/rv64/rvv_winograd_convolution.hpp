@@ -40,8 +40,8 @@ namespace cpu {
 namespace rv64 {
 
 // Winograd domain specification for GEMM-based Winograd convolution.
-// Single-core execution: processes batches sequentially with
-// local input/output buffers to keep working set in cache.
+// Batch-parallel execution: workers process disjoint batch ranges and use
+// private input/output scratchpad slices to preserve cache locality.
 struct WinogradDomainSpec_t {
     // Matrix dimensions for brgemm: C[OC×tiles] = A[OC×IC] × B[IC×tiles]
     dim_t M; // Total tiles per batch = ceil(oh/2) * ceil(ow/2)
@@ -86,6 +86,7 @@ struct rvv_winograd_conf_t {
 
     // Winograd transform parameters
     dim_t mb; // Batch size
+    int nthr; // Number of batch-parallel threads
 
     // Winograd domain specification for GEMM-based execution
     WinogradDomainSpec_t wspec;
@@ -149,6 +150,9 @@ struct rvv_wino_convolution_fwd_t : public primitive_t {
 
             VDISPATCH_CONV(mayiuse(v), VERBOSE_UNSUPPORTED_ISA);
             VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
+            const bool is_auto = desc()->alg_kind == alg_kind::convolution_auto;
+            VDISPATCH_CONV(set_default_alg_kind(alg_kind::convolution_winograd),
+                    VERBOSE_BAD_ALGORITHM);
 
             // Check data types: f32 only
             VDISPATCH_CONV(with_bias()
@@ -206,12 +210,36 @@ struct rvv_wino_convolution_fwd_t : public primitive_t {
             VDISPATCH_CONV(src_d.dims()[1] >= 96 && dst_d.dims()[1] >= 96,
                     VERBOSE_UNSUPPORTED_FEATURE,
                     "ic and oc must be >= 96 for winograd");
-
-            // Winograd dispatch is restricted to single-core execution.
-            // On multi-core, brgemm's spatial parallelism is superior.
-            VDISPATCH_CONV(dnnl_get_max_threads() <= 1,
+            VDISPATCH_CONV(!is_auto
+                            || (src_d.dims()[1] >= 128
+                                    && dst_d.dims()[1] >= 128),
                     VERBOSE_UNSUPPORTED_FEATURE,
-                    "winograd only beneficial for single-thread execution");
+                    "ic and oc must be >= 128 for auto winograd");
+
+            const dim_t nb_wino_tiles
+                    = ((dst_d.dims()[2] + 1) / 2) * ((dst_d.dims()[3] + 1) / 2);
+            VDISPATCH_CONV(!is_auto || nb_wino_tiles >= 100,
+                    VERBOSE_UNSUPPORTED_FEATURE, "too few winograd tiles");
+            const int nthr = dnnl_get_max_threads();
+            const bool is_auto_wino_profitable_small_nthr = nthr <= 8
+                    && dst_d.dims()[2] >= 28 && dst_d.dims()[3] >= 28
+                    && ((src_d.dims()[0] >= 50)
+                            || (src_d.dims()[0] >= 32 && dst_d.dims()[1] >= 256)
+                            || (src_d.dims()[0] >= 32 && dst_d.dims()[2] >= 56
+                                    && dst_d.dims()[3] >= 56));
+            const bool is_auto_wino_profitable_many_nthr = nthr > 8
+                    && src_d.dims()[0] >= 50 && src_d.dims()[1] == 128
+                    && dst_d.dims()[1] == 128 && dst_d.dims()[2] == 28
+                    && dst_d.dims()[3] == 28;
+            const bool is_auto_wino_profitable = !is_auto
+                    || is_auto_wino_profitable_small_nthr
+                    || is_auto_wino_profitable_many_nthr;
+            VDISPATCH_CONV(is_auto_wino_profitable, VERBOSE_UNSUPPORTED_FEATURE,
+                    "shape is not profitable for auto winograd");
+
+            VDISPATCH_CONV(nthr <= 1 || src_d.dims()[0] >= nstl::min(nthr, 8),
+                    VERBOSE_UNSUPPORTED_FEATURE,
+                    "minibatch is too small for multi-thread winograd");
 
             // Minimum output spatial dimensions for Winograd benefit
             VDISPATCH_CONV(dst_d.dims()[2] >= 7 && dst_d.dims()[3] >= 7,
@@ -233,10 +261,6 @@ struct rvv_wino_convolution_fwd_t : public primitive_t {
                 brgemm_kernel_t *kernel = nullptr;
                 CHECK(brgemm_kernel_create(&kernel, brg_desc));
                 brg_kernel_.reset(kernel);
-            }
-
-            if (desc()->alg_kind == alg_kind::convolution_auto) {
-                set_default_alg_kind(alg_kind::convolution_winograd);
             }
 
             return status::success;
