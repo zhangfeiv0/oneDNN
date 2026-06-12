@@ -1,5 +1,6 @@
 /*******************************************************************************
 * Copyright 2025 ZTE Corporation
+* Copyright 2026 Institute of Software, Chinese Academy of Sciences
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,11 +19,97 @@
 #define CPU_RV64_JIT_PRIMITIVE_CONF_HPP
 
 #include "common/c_types_map.hpp"
+#include "common/primitive_attr.hpp"
+
+#include "cpu/rv64/cpu_isa_traits.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace cpu {
 namespace rv64 {
+
+// Memory layout family handled by the pooling kernel. Both are plain (no
+// blocked tags): nspc vectorizes along C, ncsp vectorizes along OW.
+enum class jit_pool_tag_kind_t { undef, nspc, ncsp };
+
+// Centralized pooling configuration, populated by
+// jit_uni_pool_kernel_t::init_conf and consumed by the driver and the kernel.
+// Mirrors the role of aarch64/x64 jit_pool_conf_t (kept lean: no c_block /
+// blocked-format / transpose fields, which the RVV path does not use).
+struct jit_pool_conf_t {
+    int ndims;
+    int mb, c;
+    int id, ih, iw, od, oh, ow;
+    int stride_d, stride_h, stride_w;
+    int kd, kh, kw;
+    int f_pad, t_pad, l_pad;
+    alg_kind_t alg;
+    bool is_backward;
+    data_type_t src_dt;
+    data_type_t dst_dt;
+    int dt_size;
+    jit_pool_tag_kind_t tag_kind;
+    cpu_isa_t isa;
+    bool with_postops;
+    bool with_eltwise;
+    bool with_binary;
+    bool with_relu; // single ReLU eltwise fused into the kernel (f32 only)
+    float relu_alpha;
+    post_ops_t post_ops;
+    int nthr;
+    // Output-width unroll for the shape-baked interior kernel (number of OW
+    // positions whose accumulators share loaded inputs, ARM max_step style).
+    int ur_w;
+};
+
+// Per-call arguments for the agnostic (runtime-shape) kernel. Unlike aarch64/x64
+// — which bake the pooling window into the generated code — this kernel is
+// shape-agnostic and receives the window bounds and strides here, so one routine
+// per instantiation serves ncsp, OW==1, the nspc boundary columns, and (for f16)
+// the whole nspc row. (The f32 nspc interior uses the shape-baked kernel with
+// jit_uni_pool_interior_args_t.)
+struct jit_uni_pooling_args_t {
+    const void *src;
+    void *dst;
+    dim_t channels;
+    dim_t id_start, ih_start, iw_start;
+    dim_t id_end, ih_end, iw_end;
+    dim_t inW_stride; // IW * C (elements) for nspc, IW for ncsp
+    dim_t inD_stride; // IH * IW * C (elements) for nspc, IH*IW for ncsp
+    dim_t w_spatial_byte_stride; // C*dt_size for nspc, 1*dt_size for ncsp
+    float init_val; // -FLT_MAX (max) / 0 (avg); the f16 kernel bakes its own
+    float scale_val; // 1.0/count for avg, unused for max
+    float relu_alpha;
+    bool with_relu;
+    dim_t src_vec_byte_stride; // byte stride between vector elements in src
+    dim_t dst_vec_byte_stride; // byte stride between vector elements in dst
+    // f16 generic path row unrolling: process n_pos output positions in one
+    // call (adjacent positions share the window, so only the base pointers
+    // advance). The f32 agnostic kernel ignores these fields and always handles
+    // a single output position; f32 nspc interior reuse is handled by
+    // jit_uni_pool_interior_args_t instead.
+    dim_t n_pos = 1;
+    dim_t pos_src_byte_stride = 0;
+    dim_t pos_dst_byte_stride = 0;
+};
+
+// Per-call arguments for the shape-baked interior kernel. The unroll structure
+// (kw, stride_w, ur_w), the algorithm, init value, avg_include scale, and
+// with_relu/relu_alpha are baked into the generated code. Element strides are
+// passed (not baked) so the kernel stays correct for tensors whose strides
+// exceed 32 bits; the kernel derives the per-block strides from w_stride.
+struct jit_uni_pool_interior_args_t {
+    const void *src; // channel 0 of (id_start, ih_start, iw_block_start)
+    void *dst; // channel 0 of the first output column in the block
+    dim_t channels; // remaining channels (VLA tail handled by vsetvli)
+    dim_t kh_count; // valid kernel rows  = ih_end - ih_start
+    dim_t kd_count; // valid kernel planes = id_end - id_start
+    dim_t n_blocks; // number of ur_w output blocks to process in this call
+    dim_t w_stride; // byte stride between W positions (= C * dt_size)
+    dim_t inW_stride; // byte stride between H rows (= iw * C * dt_size)
+    dim_t inD_stride; // byte stride between D planes (= ih * iw * C * dt_size)
+    float scale_val; // 1 / window for avg_exclude (ignored otherwise)
+};
 
 struct jit_1x1_conv_conf_t {
     prop_kind_t prop_kind;

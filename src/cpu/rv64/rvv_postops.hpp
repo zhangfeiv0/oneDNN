@@ -52,7 +52,11 @@ struct rvv_postops_t {
         CHECK(local_post_ops.set_default_formats(&dst_md));
         dst_data_type_ = dst_md.data_type;
 
-        if (dst_data_type_ != data_type::f32) return status::unimplemented;
+        // The chained eltwise/binary sub-primitives support f32 and f16 (f16
+        // requires zvfh, enforced when their pds are created below).
+        if (dst_data_type_ != data_type::f32
+                && dst_data_type_ != data_type::f16)
+            return status::unimplemented;
 
         post_op_primitives_.clear();
         po_ = local_post_ops;
@@ -131,9 +135,11 @@ struct rvv_postops_t {
     status_t execute(
             const exec_ctx_t &ctx, void *src, void *dst = nullptr) const;
 
-    // Only valid when constructed from post_ops_t (narrow constructor).
-    // Callers enforce via post_ops_ok() that only ReLU is accepted,
-    // so these always return well-defined values in supported paths.
+    // Fused-ReLU helpers for the narrow constructor, used by primitives that
+    // fuse a single ReLU directly in their own kernel (e.g. matmul) and gate on
+    // the static post_ops_ok() above (ReLU-only). These are independent of the
+    // init()/execute() chained path, which runs an arbitrary single
+    // binary/eltwise post-op as a separate primitive and supports f32 and f16.
     bool is_relu_postop() const { return alg_ == alg_kind::eltwise_relu; }
     float relu_alpha() const { return alpha_; }
 
