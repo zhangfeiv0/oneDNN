@@ -528,15 +528,15 @@ struct nspc_exec<isa, data_type::f32> {
 
 } // namespace
 
-template <cpu_isa_t isa, data_type_t d_type>
-jit_uni_pooling_fwd_t<isa, d_type>::jit_uni_pooling_fwd_t(const pd_t *apd)
+template <cpu_isa_t isa>
+jit_uni_pooling_fwd_t<isa>::jit_uni_pooling_fwd_t(const pd_t *apd)
     : primitive_t(apd) {}
 
-template <cpu_isa_t isa, data_type_t d_type>
-jit_uni_pooling_fwd_t<isa, d_type>::~jit_uni_pooling_fwd_t() = default;
+template <cpu_isa_t isa>
+jit_uni_pooling_fwd_t<isa>::~jit_uni_pooling_fwd_t() = default;
 
-template <cpu_isa_t isa, data_type_t d_type>
-status_t jit_uni_pooling_fwd_t<isa, d_type>::init(engine_t *engine) {
+template <cpu_isa_t isa>
+status_t jit_uni_pooling_fwd_t<isa>::init(engine_t *engine) {
     UNUSED(engine);
     CHECK(safe_ptr_assign(
             kernel_, new jit_uni_pool_kernel_t<isa, d_type>(pd()->jpp_.alg)));
@@ -548,8 +548,8 @@ status_t jit_uni_pooling_fwd_t<isa, d_type>::init(engine_t *engine) {
     return status::success;
 }
 
-template <cpu_isa_t isa, data_type_t d_type>
-status_t jit_uni_pooling_fwd_t<isa, d_type>::execute_forward(
+template <cpu_isa_t isa>
+status_t jit_uni_pooling_fwd_t<isa>::execute_forward(
         const exec_ctx_t &ctx) const {
 
     auto src_raw = CTX_IN_MEM(const void *, DNNL_ARG_SRC);
@@ -586,8 +586,8 @@ status_t jit_uni_pooling_fwd_t<isa, d_type>::execute_forward(
     return status::success;
 }
 
-template struct jit_uni_pooling_fwd_t<v, data_type::f32>;
-template struct jit_uni_pooling_fwd_t<zvfh, data_type::f16>;
+template struct jit_uni_pooling_fwd_t<v>;
+template struct jit_uni_pooling_fwd_t<zvfh>;
 
 } // namespace rv64
 } // namespace cpu

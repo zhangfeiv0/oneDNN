@@ -34,8 +34,11 @@ namespace impl {
 namespace cpu {
 namespace rv64 {
 
-template <cpu_isa_t isa, impl::data_type_t d_type>
+template <cpu_isa_t isa>
 struct jit_uni_pooling_fwd_t : public primitive_t {
+    static constexpr data_type_t d_type
+            = (isa == zvfh) ? data_type::f16 : data_type::f32;
+
     struct pd_t : public cpu_pooling_fwd_pd_t {
         using cpu_pooling_fwd_pd_t::cpu_pooling_fwd_pd_t;
 
