@@ -24,6 +24,10 @@
 #include "cpu/rv64/rvv_binary.hpp"
 #include "cpu/rv64/rvv_eltwise.hpp"
 
+#define VDISPATCH_RVV_POSTOPS(cond, msg, ...) \
+    VCONDCHECK(primitive, create, dispatch, rvv_postops, (cond), \
+            status::unimplemented, msg, ##__VA_ARGS__)
+
 namespace dnnl {
 namespace impl {
 namespace cpu {
@@ -54,9 +58,9 @@ struct rvv_postops_t {
 
         // The chained eltwise/binary sub-primitives support f32 and f16 (f16
         // requires zvfh, enforced when their pds are created below).
-        if (dst_data_type_ != data_type::f32
-                && dst_data_type_ != data_type::f16)
-            return status::unimplemented;
+        const bool dst_type_ok
+                = utils::one_of(dst_data_type_, data_type::f32, data_type::f16);
+        VDISPATCH_RVV_POSTOPS(dst_type_ok, VERBOSE_UNSUPPORTED_DT);
 
         post_op_primitives_.clear();
         po_ = local_post_ops;
