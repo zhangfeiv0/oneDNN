@@ -70,12 +70,13 @@ public:
     status_t copy(const memory_storage_t &src, const memory_storage_t &dst,
             size_t size, const xpu::event_t &deps,
             xpu::event_t &out_dep) override {
-        return impl()->copy(this, src, dst, size, deps, out_dep, &profiler());
+        return impl()->copy(
+                this, src, dst, size, deps, out_dep, profiler_.get());
     }
 
     status_t fill(const memory_storage_t &dst, uint8_t pattern, size_t size,
             const xpu::event_t &deps, xpu::event_t &out_dep) override {
-        return impl()->fill(dst, pattern, size, deps, out_dep, &profiler());
+        return impl()->fill(dst, pattern, size, deps, out_dep, profiler_.get());
     }
 
     const xpu::sycl::context_t &sycl_ctx() const { return impl()->sycl_ctx(); }

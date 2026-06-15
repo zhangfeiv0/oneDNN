@@ -41,6 +41,10 @@ public:
 
     virtual xpu::context_t &ctx() = 0;
     virtual const xpu::context_t &ctx() const = 0;
+
+    // These two calls are valid only when `profiler_` is not empty.
+    // When the call relies on an underlying pointer, always use
+    // `profiler_.get()`.
     virtual const xpu::stream_profiler_t &profiler() const {
         return *profiler_;
     }
