@@ -16,10 +16,12 @@
 #ifndef CPU_RV64_RVV_MATMUL_HPP
 #define CPU_RV64_RVV_MATMUL_HPP
 
+#include <memory>
+
 #include "common/primitive.hpp"
 #include "common/utils.hpp"
 #include "cpu/matmul/cpu_matmul_pd.hpp"
-#include "cpu/rv64/rvv_postops.hpp"
+#include "cpu/rv64/jit_uni_postops_kernel.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -62,10 +64,28 @@ struct rvv_matmul_t : public primitive_t {
                     attr()->has_default_values(smask_t::post_ops, d_type),
                     VERBOSE_UNSUPPORTED_ATTR);
 
-            VDISPATCH_MATMUL(rvv_postops_t::post_ops_ok(attr()->post_ops_),
+            // Resolve the primary and the post-op binary src1 formats before any
+            // layout / post-op check: a post-op binary src1 may be format_any and
+            // must be matched against dst before binary_broadcast_ok() inspects
+            // its layout (x64 calls attr_.set_default_formats first as well).
+            VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+            VDISPATCH_MATMUL(
+                    attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
 
-            VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+            // Post-ops are applied per output row (length N) by the unified
+            // injector kernel: a chain of supported eltwise ops plus any number
+            // of binaries whose src1 is scalar or per-N (broadcast over M/batch).
+            const dim_t N = weights_mdw.dims()[weights_mdw.ndims() - 1];
+            VDISPATCH_MATMUL(jit_uni_postops_kernel_t::post_ops_supported(
+                                     attr()->post_ops_, N),
+                    VERBOSE_UNSUPPORTED_POSTOP);
+            // A non-scalar binary rhs must be strict per-N (broadcast over M and
+            // batch): the per-row execute uses a fixed offset, so e.g. per-M
+            // [M,1] (which slips past nelems==N when M==N) must fall back.
+            VDISPATCH_MATMUL(jit_uni_postops_kernel_t::binary_per_last_dim_ok(
+                                     attr()->post_ops_, N),
+                    VERBOSE_UNSUPPORTED_POSTOP);
 
             VDISPATCH_MATMUL(check_layouts(src_mdw, weights_mdw, dst_mdw),
                     VERBOSE_UNSUPPORTED_TAG);
@@ -85,8 +105,6 @@ struct rvv_matmul_t : public primitive_t {
 
             VDISPATCH_MATMUL(check_bias(dst_mdw, bias_mdw),
                     VERBOSE_UNSUPPORTED_BIAS_CFG);
-
-            VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
 
             init_gemm_conf(src_mdw, weights_mdw);
 
@@ -187,10 +205,15 @@ struct rvv_matmul_t : public primitive_t {
     };
 
     rvv_matmul_t(const pd_t *apd) : primitive_t(apd) {}
-    status_t execute(const exec_ctx_t &ctx) const;
+
+    status_t init(engine_t *engine) override;
+    status_t execute(const exec_ctx_t &ctx) const override;
 
 private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
+
+    // Per-row "bias + post-op chain" kernel (shared gemm post-op epilogue).
+    std::shared_ptr<jit_uni_postops_kernel_t> postops_kernel_;
 };
 
 } // namespace matmul

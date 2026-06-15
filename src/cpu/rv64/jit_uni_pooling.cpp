@@ -61,9 +61,11 @@ init_scale_t compute_init_scale(alg_kind_t alg, int id_start, int id_end,
 
 // Value the kernel would write for an output whose pooling window lies entirely
 // in padding: the accumulator init (max -> dtype lowest, avg -> 0), which avg
-// scaling leaves at 0, after the fused f32 ReLU. Used to fill such outputs
-// directly, skipping the per-output JIT call. Any separate (non-fused) post-op
-// runs afterward on the whole dst, so it must NOT be applied here.
+// scaling leaves at 0, with the fused f32 single-ReLU baked in (with_relu). Used
+// to fast-fill such outputs, skipping the per-output JIT call. Post-ops are fused
+// in-kernel now (there is no separate post-op pass); a fused chain this value
+// cannot reproduce has its empty windows routed through the kernel instead (see
+// execute_forward), and unsupported chains fall back to ref_pooling.
 template <typename data_t>
 data_t empty_window_value(const jit_pool_conf_t &jpp) {
     if (jpp.alg == alg_kind::pooling_max) {
@@ -128,13 +130,34 @@ jit_uni_pooling_args_t make_pooling_params(alg_kind_t alg,
     return p;
 }
 
+// Binary post-op rhs base for a channel-vectorized kernel call writing to
+// p_dst. A full-dst src1 follows the dst layout, so it offsets with the output
+// position (rhs + (p_dst - dst)); per-oc ([1,C,1,..]) and per-tensor src1 use
+// the base directly. Returns nullptr when no binary post-op is fused.
+template <typename data_t>
+const void *binary_rhs_for(const jit_pool_conf_t &jpp, const void *rhs,
+        const data_t *dst, const void *p_dst) {
+    if (!jpp.fuse_binary || rhs == nullptr) return nullptr;
+    bool full = false;
+    for (int i = 0; i < jpp.post_ops.len(); i++) {
+        const auto &e = jpp.post_ops.entry_[i];
+        if (!e.is_binary()) continue;
+        const memory_desc_wrapper s1(e.binary.src1_desc);
+        full = s1.nelems() != 1 && s1.nelems() != (dim_t)jpp.c;
+    }
+    if (!full) return rhs;
+    return static_cast<const void *>(static_cast<const data_t *>(rhs)
+            + (static_cast<const data_t *>(p_dst) - dst));
+}
+
 // nspc: vectorize along C. Interior columns are handled by the shape-baked
 // ur_w-reuse kernel (full ur_w blocks); the few boundary columns and the
 // sub-ur_w interior remainder fall back to one vectorize-C call per column.
 template <cpu_isa_t isa, data_type_t d_type>
 void pooling_nspc(const kernel_t<isa, d_type> &kernel,
         const jit_uni_pool_interior_kernel_t<isa, d_type> &ikernel,
-        const jit_pool_conf_t &jpp, const float *src, float *dst) {
+        const jit_pool_conf_t &jpp, const float *src, float *dst,
+        const void *po_rhs) {
     const dim_t batch = jpp.mb, channels = jpp.c;
     const dim_t outD = jpp.od, outH = jpp.oh, outW = jpp.ow;
     const dim_t inD = jpp.id, inH = jpp.ih, inW = jpp.iw;
@@ -169,15 +192,17 @@ void pooling_nspc(const kernel_t<isa, d_type> &kernel,
                     od, oh, ow, outD, outH, outW, inD, inH, inW, kerD, kerH,
                     kerW, strideD, strideH, strideW, padFront, padTop, padLeft,
                     inW_stride, inD_stride, with_relu, relu_alpha);
-            if (p.id_start >= p.id_end || p.ih_start >= p.ih_end
-                    || p.iw_start >= p.iw_end) {
-                // Empty window: fill all (contiguous) channels, skip the kernel.
+            if ((p.id_start >= p.id_end || p.ih_start >= p.ih_end
+                        || p.iw_start >= p.iw_end)
+                    && !jpp.fuse_eltwise && !jpp.fuse_binary) {
+                // Empty window, no fused post-op: fill channels, skip the kernel.
                 const float ev = empty_window_value<float>(jpp);
                 float *d = static_cast<float *>(p.dst);
                 for (dim_t c = 0; c < channels; c++)
                     d[c] = ev;
                 return;
             }
+            p.post_op_rhs = binary_rhs_for(jpp, po_rhs, dst, p.dst);
             kernel(&p);
         };
 
@@ -197,7 +222,10 @@ void pooling_nspc(const kernel_t<isa, d_type> &kernel,
         const bool row_in_pad = (kd_count == 0 || kh_count == 0);
 
         const dim_t n_int = (int_lo < int_hi) ? (int_hi - int_lo) : 0;
-        const dim_t n_blocks = row_in_pad ? 0 : (n_int / ur_w);
+        // Binary post-ops are applied only on the channel-vectorized
+        // single-position path, so skip the shape-baked interior kernel then.
+        const dim_t n_blocks
+                = (row_in_pad || jpp.fuse_binary) ? 0 : (n_int / ur_w);
         const dim_t baked_hi = int_lo + n_blocks * ur_w;
 
         // Left boundary columns.
@@ -247,7 +275,7 @@ void pool_column_vec_c(const kernel_t<isa, d_type> &kernel,
         const jit_pool_conf_t &jpp,
         const typename prec_traits_t<d_type>::type *src,
         typename prec_traits_t<d_type>::type *dst, dim_t mb, dim_t od, dim_t oh,
-        dim_t ow) {
+        dim_t ow, const void *po_rhs) {
     using data_t = typename prec_traits_t<d_type>::type;
     const dim_t channels = jpp.c;
     const dim_t outD = jpp.od, outH = jpp.oh, outW = jpp.ow;
@@ -275,11 +303,13 @@ void pool_column_vec_c(const kernel_t<isa, d_type> &kernel,
             + od * outH * outW + oh * outW + ow;
 
     // Output whose window lies entirely in padding (legal for max /
-    // avg_include; only avg_exclude is rejected upstream). Fill all channels
-    // with the value the kernel would produce and skip the JIT call. This both
-    // avoids per-call overhead on heavily-padded shapes and avoids forming an
-    // out-of-range src_base (start indices can exceed the input extent here).
-    if (kd_cnt == 0 || kh_cnt == 0 || kw_cnt == 0) {
+    // avg_include; only avg_exclude is rejected upstream). With no fused post-op
+    // we fill all channels directly with the value the kernel would produce and
+    // skip the JIT call (avoids per-call overhead and an out-of-range src_base).
+    // With a fused post-op the kernel must run so the post-op is applied to the
+    // init value; the window loops are skipped (id_end==0, ...) so src is unread.
+    const bool empty = (kd_cnt == 0 || kh_cnt == 0 || kw_cnt == 0);
+    if (empty && !jpp.fuse_eltwise && !jpp.fuse_binary) {
         const data_t ev = empty_window_value<data_t>(jpp);
         for (dim_t c = 0; c < channels; c++)
             dst_base[(size_t)c * dst_spatial_size] = ev;
@@ -289,8 +319,12 @@ void pool_column_vec_c(const kernel_t<isa, d_type> &kernel,
     auto iv = compute_init_scale(jpp.alg, id_start, id_end, ih_start, ih_end,
             iw_start, iw_end, kerD, kerH, kerW);
 
-    const data_t *src_base = src + (size_t)mb * channels * spatial_size
-            + (size_t)id_start * inH * inW + (size_t)ih_start * inW + iw_start;
+    // Empty window: the kernel reads no src, so use the channel base to avoid
+    // forming an out-of-range pointer (start indices can exceed the input).
+    const data_t *src_base = empty ? src + (size_t)mb * channels * spatial_size
+                                   : src + (size_t)mb * channels * spatial_size
+                    + (size_t)id_start * inH * inW + (size_t)ih_start * inW
+                    + iw_start;
 
     jit_uni_pooling_args_t p;
     p.src = src_base;
@@ -311,6 +345,7 @@ void pool_column_vec_c(const kernel_t<isa, d_type> &kernel,
     p.with_relu = jpp.with_relu;
     p.src_vec_byte_stride = (dim_t)(spatial_size * sizeof(data_t));
     p.dst_vec_byte_stride = (dim_t)(dst_spatial_size * sizeof(data_t));
+    p.post_op_rhs = binary_rhs_for(jpp, po_rhs, dst, p.dst);
     kernel(&p);
 }
 
@@ -321,7 +356,7 @@ template <cpu_isa_t isa, data_type_t d_type>
 void pooling_ncsp(const kernel_t<isa, d_type> &kernel,
         const jit_pool_conf_t &jpp,
         const typename prec_traits_t<d_type>::type *src,
-        typename prec_traits_t<d_type>::type *dst) {
+        typename prec_traits_t<d_type>::type *dst, const void *po_rhs) {
     using data_t = typename prec_traits_t<d_type>::type;
     const dim_t batch = jpp.mb, channels = jpp.c;
     const dim_t outD = jpp.od, outH = jpp.oh, outW = jpp.ow;
@@ -337,13 +372,22 @@ void pooling_ncsp(const kernel_t<isa, d_type> &kernel,
     const size_t spatial_size = (size_t)inD * inH * inW;
     const size_t dst_spatial_size = (size_t)outD * outH * outW;
 
-    const dim_t int_lo = std::max((padL + strideW - 1) / strideW, (dim_t)0);
+    // Binary post-ops are applied only on the channel-vectorized path, so when
+    // a binary post-op is fused force every column through pool_column_vec_c by
+    // emptying the OW-vectorized interior range.
+    const dim_t int_lo = jpp.fuse_binary
+            ? 0
+            : std::max((padL + strideW - 1) / strideW, (dim_t)0);
     // See pooling_nspc: avoid truncating-division over-count when the kernel
     // is wider than the padded input (no full-window column then).
-    const dim_t int_hi = (inW + padL >= kerW)
-            ? std::min(
-                      std::max((inW - kerW + padL) / strideW + 1, int_lo), outW)
-            : int_lo;
+    const dim_t int_hi = jpp.fuse_binary
+            ? 0
+            : ((inW + padL >= kerW)
+                              ? std::min(std::max((inW - kerW + padL) / strideW
+                                                         + 1,
+                                                 int_lo),
+                                        outW)
+                              : int_lo);
 
     // Interior columns: vectorize along OW.
     if (int_lo < int_hi) {
@@ -363,9 +407,14 @@ void pooling_ncsp(const kernel_t<isa, d_type> &kernel,
                     = std::min((int)(oh * strideH - padT + kerH), (int)inH);
 
             // Whole (od, oh) row in front/top or back/bottom padding: every
-            // interior column is an empty window. Fill them directly and skip
-            // the JIT call (big win on heavily-padded shapes).
-            if (id_start >= id_end || ih_start >= ih_end) {
+            // interior column is an empty window. With no fused post-op, fill
+            // them directly and skip the JIT call (big win on heavily-padded
+            // shapes). With a fused chain, fall through so the kernel applies the
+            // post-op to the init value (avg scale is 0 for an empty window, so
+            // the result is post_op(0); max is post_op(lowest)) — matching the
+            // call_one paths and x86/ARM, which always run the kernel.
+            if ((id_start >= id_end || ih_start >= ih_end) && !jpp.fuse_eltwise
+                    && !jpp.fuse_binary) {
                 const data_t ev = empty_window_value<data_t>(jpp);
                 for (dim_t ow = int_lo; ow < int_hi; ow++)
                     dst_oh[ow] = ev;
@@ -409,7 +458,7 @@ void pooling_ncsp(const kernel_t<isa, d_type> &kernel,
                 [&](dim_t mb, dim_t od, dim_t oh, dim_t k) {
             const dim_t ow = (k < lo) ? k : hi + (k - lo);
             pool_column_vec_c<isa, d_type>(
-                    kernel, jpp, src, dst, mb, od, oh, ow);
+                    kernel, jpp, src, dst, mb, od, oh, ow, po_rhs);
         });
     }
 }
@@ -419,9 +468,10 @@ template <cpu_isa_t isa, data_type_t d_type>
 void pooling_ncsp_ow1(const kernel_t<isa, d_type> &kernel,
         const jit_pool_conf_t &jpp,
         const typename prec_traits_t<d_type>::type *src,
-        typename prec_traits_t<d_type>::type *dst) {
+        typename prec_traits_t<d_type>::type *dst, const void *po_rhs) {
     parallel_nd(jpp.mb, jpp.od, jpp.oh, [&](dim_t mb, dim_t od, dim_t oh) {
-        pool_column_vec_c<isa, d_type>(kernel, jpp, src, dst, mb, od, oh, 0);
+        pool_column_vec_c<isa, d_type>(
+                kernel, jpp, src, dst, mb, od, oh, 0, po_rhs);
     });
 }
 
@@ -432,7 +482,7 @@ template <cpu_isa_t isa, data_type_t d_type>
 void pooling_nspc_generic(const kernel_t<isa, d_type> &kernel,
         const jit_pool_conf_t &jpp,
         const typename prec_traits_t<d_type>::type *src,
-        typename prec_traits_t<d_type>::type *dst) {
+        typename prec_traits_t<d_type>::type *dst, const void *po_rhs) {
     using data_t = typename prec_traits_t<d_type>::type;
     const dim_t batch = jpp.mb, channels = jpp.c;
     const dim_t outD = jpp.od, outH = jpp.oh, outW = jpp.ow;
@@ -467,15 +517,17 @@ void pooling_nspc_generic(const kernel_t<isa, d_type> &kernel,
                     od, oh, ow, outD, outH, outW, inD, inH, inW, kerD, kerH,
                     kerW, strideD, strideH, strideW, padFront, padTop, padLeft,
                     inW_stride, inD_stride, with_relu, relu_alpha);
-            if (p.id_start >= p.id_end || p.ih_start >= p.ih_end
-                    || p.iw_start >= p.iw_end) {
-                // Empty window: fill all (contiguous) channels, skip the kernel.
+            if ((p.id_start >= p.id_end || p.ih_start >= p.ih_end
+                        || p.iw_start >= p.iw_end)
+                    && !jpp.fuse_eltwise && !jpp.fuse_binary) {
+                // Empty window, no fused post-op: fill channels, skip the kernel.
                 const data_t ev = empty_window_value<data_t>(jpp);
                 data_t *d = static_cast<data_t *>(p.dst);
                 for (dim_t c = 0; c < channels; c++)
                     d[c] = ev;
                 return;
             }
+            p.post_op_rhs = binary_rhs_for(jpp, po_rhs, dst, p.dst);
             kernel(&p);
         };
 
@@ -511,9 +563,9 @@ struct nspc_exec {
             const jit_uni_pool_interior_kernel_t<isa, d_type> *ik,
             const jit_pool_conf_t &jpp,
             const typename prec_traits_t<d_type>::type *src,
-            typename prec_traits_t<d_type>::type *dst) {
+            typename prec_traits_t<d_type>::type *dst, const void *po_rhs) {
         UNUSED(ik);
-        pooling_nspc_generic<isa, d_type>(k, jpp, src, dst);
+        pooling_nspc_generic<isa, d_type>(k, jpp, src, dst, po_rhs);
     }
 };
 
@@ -521,8 +573,9 @@ template <cpu_isa_t isa>
 struct nspc_exec<isa, data_type::f32> {
     static void run(const kernel_t<isa, data_type::f32> &k,
             const jit_uni_pool_interior_kernel_t<isa, data_type::f32> *ik,
-            const jit_pool_conf_t &jpp, const float *src, float *dst) {
-        pooling_nspc<isa, data_type::f32>(k, *ik, jpp, src, dst);
+            const jit_pool_conf_t &jpp, const float *src, float *dst,
+            const void *po_rhs) {
+        pooling_nspc<isa, data_type::f32>(k, *ik, jpp, src, dst, po_rhs);
     }
 };
 
@@ -539,7 +592,7 @@ template <cpu_isa_t isa>
 status_t jit_uni_pooling_fwd_t<isa>::init(engine_t *engine) {
     UNUSED(engine);
     CHECK(safe_ptr_assign(
-            kernel_, new jit_uni_pool_kernel_t<isa, d_type>(pd()->jpp_.alg)));
+            kernel_, new jit_uni_pool_kernel_t<isa, d_type>(pd()->jpp_)));
     // The shape-baked interior kernel is f32-only; f16 uses the generic path.
     if (d_type == data_type::f32
             && pd()->jpp_.tag_kind == jit_pool_tag_kind_t::nspc)
@@ -567,22 +620,39 @@ status_t jit_uni_pooling_fwd_t<isa>::execute_forward(
 
     const auto &jpp = pd()->jpp_;
 
+    // Binary post-op src1 base (the lone binary in the fused chain when
+    // fuse_binary); the kernels position/advance it per output position and
+    // channel chunk. The binary may sit anywhere in the chain, so use its index.
+    const void *po_rhs = nullptr;
+    if (jpp.fuse_binary) {
+        int bin_idx = 0;
+        for (int i = 0; i < jpp.post_ops.len(); i++)
+            if (jpp.post_ops.entry_[i].is_binary()) bin_idx = i;
+        po_rhs = ctx.host_ptr(
+                DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_idx) | DNNL_ARG_SRC_1);
+        // dst was shifted to its logical element 0 (off_l(0) above), and
+        // binary_rhs_for()/the kernel address the rhs relative to that logical
+        // layout (full-dst uses rhs + (p_dst - dst)). Shift the rhs base by
+        // src1's own offset0 so the two are consistent — nonzero only for
+        // submemory src1 descriptors, but otherwise it would read the wrong
+        // address.
+        const memory_desc_wrapper s1_d(
+                jpp.post_ops.entry_[bin_idx].binary.src1_desc);
+        po_rhs = (const uint8_t *)po_rhs + s1_d.off_l(0) * dt_size;
+    }
+
     if (jpp.tag_kind == jit_pool_tag_kind_t::nspc) {
         // f32 uses the shape-baked interior kernel; f16 uses the generic path.
         nspc_exec<isa, d_type>::run(
-                *kernel_, interior_kernel_.get(), jpp, src, dst);
+                *kernel_, interior_kernel_.get(), jpp, src, dst, po_rhs);
     } else { // ncsp
         if (jpp.ow == 1)
-            pooling_ncsp_ow1<isa, d_type>(*kernel_, jpp, src, dst);
+            pooling_ncsp_ow1<isa, d_type>(*kernel_, jpp, src, dst, po_rhs);
         else
-            pooling_ncsp<isa, d_type>(*kernel_, jpp, src, dst);
+            pooling_ncsp<isa, d_type>(*kernel_, jpp, src, dst, po_rhs);
     }
 
-    // Only f32 ReLU is fused in the kernel; every other post-op (incl. f16
-    // ReLU) runs here as a separate primitive.
-    if (jpp.with_postops && !jpp.with_relu)
-        CHECK(pd()->postops_.execute(ctx, dst, dst));
-
+    // All accepted post-ops are fused in the kernel; nothing to apply here.
     return status::success;
 }
 

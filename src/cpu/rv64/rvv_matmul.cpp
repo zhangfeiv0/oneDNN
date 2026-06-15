@@ -13,19 +13,39 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 *******************************************************************************/
-#include "cpu/rv64/rvv_matmul.hpp"
+#include <vector>
+
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
+#include "common/memory_desc_wrapper.hpp"
 #include "common/utils.hpp"
 #include "cpu/rv64/gemm/rvv_gemm_f32.hpp"
-#include "cpu/rv64/jit_rvv_matmul_post_kernel.hpp"
-#include "cpu/rv64/rvv_postops.hpp"
+#include "cpu/rv64/rvv_matmul.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace cpu {
 namespace rv64 {
 namespace matmul {
+
+status_t rvv_matmul_t::init(engine_t *engine) {
+    UNUSED(engine);
+    // Build the per-row "bias + post-op chain" kernel. The pd gate guarantees
+    // the chain is injector-supported, so create() succeeds here.
+    const memory_desc_wrapper bias_d(pd()->desc()->bias_desc);
+    jit_uni_postops_kernel_t::conf_t conf;
+    conf.dst_dt = data_type::f32;
+    conf.with_bias = !bias_d.is_zero();
+    if (conf.with_bias) {
+        const int bn = bias_d.ndims();
+        // scalar when the whole bias is one value or its last dim broadcasts
+        // over N; otherwise a per-N run aligned with the output row.
+        conf.bias_per_element
+                = !(bias_d.nelems() == 1 || bias_d.dims()[bn - 1] == 1);
+    }
+    return jit_uni_postops_kernel_t::create(
+            postops_kernel_, pd()->attr()->post_ops_, conf);
+}
 
 status_t rvv_matmul_t::execute(const exec_ctx_t &ctx) const {
     auto src = CTX_IN_MEM(const float *, DNNL_ARG_SRC);
@@ -38,7 +58,6 @@ status_t rvv_matmul_t::execute(const exec_ctx_t &ctx) const {
     const memory_desc_wrapper bias_d(pd()->desc()->bias_desc);
 
     const post_ops_t &post_ops = pd()->attr()->post_ops_;
-    rvv_postops_t postops_handler(post_ops);
 
     const float *bias = CTX_IN_MEM(const float *, DNNL_ARG_BIAS);
     const int ndims = src_d.ndims();
@@ -141,6 +160,21 @@ status_t rvv_matmul_t::execute(const exec_ctx_t &ctx) const {
     const int bias_ndims = bias_d.ndims();
     const dim_t *bias_dims = bias_d.dims();
 
+    // Binary post-op src1 bases, one per binary in chain order (per-N or scalar;
+    // each broadcasts over M/batch so the same array serves every row). Empty
+    // when the chain has no binary entry. Shift each base by src1's own offset0
+    // (off_l(0)) so a submemory rhs is read from its logical origin, not the
+    // buffer base — the kernel only adds the in-row column offset on top.
+    std::vector<const void *> po_rhs;
+    for (int i = 0; i < post_ops.len(); i++)
+        if (post_ops.entry_[i].is_binary()) {
+            const memory_desc_wrapper s1_d(post_ops.entry_[i].binary.src1_desc);
+            const auto *base = static_cast<const char *>(ctx.host_ptr(
+                    DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_SRC_1));
+            po_rhs.push_back(base + s1_d.off_l(0) * sizeof(float));
+        }
+    const void *const *po_rhs_arr = po_rhs.empty() ? nullptr : po_rhs.data();
+
     parallel_nd(batch, [&](dim_t b) {
         float *dst_base = dst + b * dst_batch_stride;
 
@@ -164,11 +198,9 @@ status_t rvv_matmul_t::execute(const exec_ctx_t &ctx) const {
             float *row_dst = dst_base + m * N;
 
             const float *bias_ptr = nullptr;
-            bool scalar_bias = false;
             if (bias) {
                 if (bias_d.nelems() == 1) {
                     bias_ptr = bias;
-                    scalar_bias = true;
                 } else {
                     size_t base_bias_off = 0;
                     if (bias_ndims > 1) {
@@ -180,26 +212,18 @@ status_t rvv_matmul_t::execute(const exec_ctx_t &ctx) const {
                             base_bias_off += idx * bias_strides[d];
                         }
                     }
-
                     bias_ptr = bias + base_bias_off;
-                    scalar_bias = bias_dims[bias_ndims - 1] == 1;
                 }
             }
 
-#if defined(XBYAK_RISCV_V) && XBYAK_RISCV_V == 1
-            jit_rvv_matmul_post_apply(row_dst, bias_ptr, N, bias != nullptr,
-                    scalar_bias, postops_handler.is_relu_postop(),
-                    postops_handler.relu_alpha());
-#else
-            const bool with_relu = postops_handler.is_relu_postop();
-            const float relu_alpha = postops_handler.relu_alpha();
-            for (dim_t n = 0; n < N; ++n) {
-                float value = row_dst[n];
-                if (bias) value += bias_ptr[scalar_bias ? 0 : n];
-                if (with_relu && !(value > 0.0f)) value *= relu_alpha;
-                row_dst[n] = value;
-            }
-#endif
+            // Fused bias + post-op chain over this output row (length N).
+            jit_uni_postops_kernel_t::call_params_t cp;
+            cp.dst = row_dst;
+            cp.bias = bias_ptr;
+            cp.rhs = po_rhs_arr;
+            cp.off0 = 0; // per-N rhs starts at column 0 of every row
+            cp.len = N;
+            (*postops_kernel_)(&cp);
         }
     });
 

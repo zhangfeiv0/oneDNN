@@ -51,9 +51,11 @@ struct jit_pool_conf_t {
     jit_pool_tag_kind_t tag_kind;
     cpu_isa_t isa;
     bool with_postops;
-    bool with_eltwise;
-    bool with_binary;
-    bool with_relu; // single ReLU eltwise fused into the kernel (f32 only)
+    bool with_relu; // f32 single-ReLU flag; feeds empty_window_value() only.
+            // The post-op chain is fused via fuse_eltwise/fuse_binary.
+    bool fuse_eltwise; // eltwise post-op chain fused in-kernel via the injector
+            // (f32 and f16 eltwise-only)
+    bool fuse_binary; // f32 binary post-op fused in-kernel (channel-vec path)
     float relu_alpha;
     post_ops_t post_ops;
     int nthr;
@@ -83,6 +85,10 @@ struct jit_uni_pooling_args_t {
     bool with_relu;
     dim_t src_vec_byte_stride; // byte stride between vector elements in src
     dim_t dst_vec_byte_stride; // byte stride between vector elements in dst
+    // Binary post-op rhs (src1) base for this call. For full-dst per-element it
+    // points at the element matching this position's channel 0; for per-oc /
+    // per-tensor it points at the channel-0 / scalar value. Unused otherwise.
+    const void *post_op_rhs = nullptr;
     // f16 generic path row unrolling: process n_pos output positions in one
     // call (adjacent positions share the window, so only the base pointers
     // advance). The f32 agnostic kernel ignores these fields and always handles
@@ -94,9 +100,9 @@ struct jit_uni_pooling_args_t {
 };
 
 // Per-call arguments for the shape-baked interior kernel. The unroll structure
-// (kw, stride_w, ur_w), the algorithm, init value, avg_include scale, and
-// with_relu/relu_alpha are baked into the generated code. Element strides are
-// passed (not baked) so the kernel stays correct for tensors whose strides
+// (kw, stride_w, ur_w), the algorithm, init value, avg_include scale, and the
+// fused eltwise post-op chain are baked into the generated code. Element strides
+// are passed (not baked) so the kernel stays correct for tensors whose strides
 // exceed 32 bits; the kernel derives the per-block strides from w_stride.
 struct jit_uni_pool_interior_args_t {
     const void *src; // channel 0 of (id_start, ih_start, iw_block_start)

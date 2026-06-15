@@ -20,6 +20,7 @@
 
 #include "common/broadcast_strategy.hpp"
 #include "common/c_types_map.hpp"
+#include "common/memory_desc_wrapper.hpp"
 #include "common/memory_tracking.hpp"
 #include "common/primitive.hpp"
 #include "common/utils.hpp"
@@ -28,6 +29,7 @@
 #include "cpu/cpu_convolution_pd.hpp"
 #include "cpu/gemm/gemm.hpp"
 #include "cpu/primitive_attr_postops.hpp"
+#include "cpu/rv64/jit_uni_postops_kernel.hpp"
 #include "cpu/rv64/rvv_gemm_convolution_utils.hpp"
 
 namespace dnnl {
@@ -119,6 +121,37 @@ struct riscv_gemm_convolution_fwd_t : public primitive_t {
         if (jcp.with_eltwise || jcp.with_binary) {
             CHECK(safe_ptr_assign(post_ops_, new ref_post_ops_t(jcp.post_ops)));
             CHECK(post_ops_->init(pd()->dst_md()));
+
+            // In-kernel fast path for the nspc layout: an injector-emittable
+            // chain (eltwise plus scalar/per-oc binary) runs through
+            // jit_uni_postops_kernel_t over the contiguous oc-slice (channels
+            // are innermost in nspc), replacing the scalar ref loop. The pd's
+            // post_ops_ok() already restricts binaries to scalar/per-oc, which
+            // the kernel reads as a per-element run over the slice (rhs base +
+            // channel-base off0). create() returns unimplemented for chains it
+            // cannot cover (sum, prelu, unsupported alg), leaving the kernel null
+            // so the ref_post_ops_t / fast-relu paths handle them. Bias is
+            // applied separately beforehand, so the kernel is bias-free. This is
+            // consumed in execute_forward_thr_nspc; the ncsp layout keeps ref.
+            const auto &po = pd()->attr()->post_ops_;
+            // The fast path reads a per-oc binary rhs as a contiguous oc run
+            // (base + channel-base off0, vle32), so a non-dense per-oc rhs must
+            // keep the ref_post_ops path. Scalars are layout-agnostic.
+            bool jit_bin_ok = true;
+            for (int i = 0; i < po.len(); i++) {
+                const auto &e = po.entry_[i];
+                if (!e.is_binary()) continue;
+                const memory_desc_wrapper s1(e.binary.src1_desc);
+                if (s1.nelems(true) != 1 && !s1.is_dense(true))
+                    jit_bin_ok = false;
+            }
+            if (jcp.is_nspc && po.len() > 0 && jit_bin_ok) {
+                jit_uni_postops_kernel_t::conf_t conf;
+                conf.dst_dt = data_type::f32;
+                conf.with_bias = false; // bias applied separately for nspc
+                conf.bias_per_element = false;
+                jit_uni_postops_kernel_t::create(jit_postops_kernel_, po, conf);
+            }
         }
         return status::success;
     }
@@ -140,6 +173,9 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
     std::unique_ptr<ref_post_ops_t> post_ops_;
+    // In-kernel post-op fast path: eltwise + scalar/per-oc binary (null -> use
+    // ref_post_ops_ above).
+    std::shared_ptr<jit_uni_postops_kernel_t> jit_postops_kernel_;
 };
 
 } // namespace rv64
