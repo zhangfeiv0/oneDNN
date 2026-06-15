@@ -22,7 +22,6 @@
 
 #include "cpu/cpu_batch_normalization_pd.hpp"
 #include "cpu/platform.hpp"
-#include "cpu/rv64/rvv_postops.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -64,24 +63,20 @@ struct rvv_batch_normalization_fwd_t : public primitive_t {
                                             == prop_kind::forward_training),
                     VERBOSE_UNSUPPORTED_FEATURE,
                     "forward training with fused ReLU is not supported");
-            // Only support eltwise ReLU without alpha/beta post-op as current rvv_postops requires.
+            // Only a single plain ReLU (negative-slope 0, scale 1) is supported
+            // as a post-op; it is applied inside the bnorm kernel as max(0, x).
             VDISPATCH_BNORM(attr()->has_default_values(smask_t::post_ops),
                     VERBOSE_UNSUPPORTED_ATTR);
             {
+                // is_relu(true, true) requires scale == 1 and negative-slope == 0,
+                // matching x64/aarch64's with_relu_post_op(). A scaled or leaky
+                // ReLU (whose scale/slope the kernel would silently ignore) falls
+                // back to ref.
                 const post_ops_t &po = attr()->post_ops_;
-                bool relu_no_params_ok = true;
-                if (po.len() == 1) {
-                    const auto &e = po.entry_[0];
-                    relu_no_params_ok = e.is_eltwise()
-                            && e.eltwise.alg == alg_kind::eltwise_relu
-                            && e.eltwise.alpha == 0.f && e.eltwise.beta == 0.f;
-                } else if (po.len() > 1) {
-                    relu_no_params_ok = false;
-                }
-                VDISPATCH_BNORM(relu_no_params_ok, VERBOSE_UNSUPPORTED_ATTR);
+                const bool relu_ok = po.len() == 0
+                        || (po.len() == 1 && po.entry_[0].is_relu(true, true));
+                VDISPATCH_BNORM(relu_ok, VERBOSE_UNSUPPORTED_ATTR);
             }
-            VDISPATCH_BNORM(rv64::rvv_postops_t::post_ops_ok(attr()->post_ops_),
-                    VERBOSE_UNSUPPORTED_ATTR);
 
             // Simplest memory layouts only: plain, dense, same layout src/dst, no blocking/padding.
             VDISPATCH_BNORM(

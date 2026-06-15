@@ -34,12 +34,14 @@ namespace rv64 {
 using namespace Xbyak_riscv;
 
 template <cpu_isa_t isa, data_type_t d_type>
-jit_uni_pool_kernel_t<isa, d_type>::jit_uni_pool_kernel_t(alg_kind_t alg)
-    : jit_generator_t(alg == alg_kind::pooling_max ? "jit_rvv_pool_fwd_max"
-                      : alg == alg_kind::pooling_avg_include_padding
+jit_uni_pool_kernel_t<isa, d_type>::jit_uni_pool_kernel_t(
+        const jit_pool_conf_t &jpp)
+    : jit_generator_t(jpp.alg == alg_kind::pooling_max ? "jit_rvv_pool_fwd_max"
+                      : jpp.alg == alg_kind::pooling_avg_include_padding
                       ? "jit_rvv_pool_fwd_avg_inc"
                       : "jit_rvv_pool_fwd_avg_exc")
-    , is_max_pool_(alg == alg_kind::pooling_max) {
+    , jpp_(jpp)
+    , is_max_pool_(jpp.alg == alg_kind::pooling_max) {
     create_kernel();
 }
 
@@ -97,28 +99,44 @@ status_t jit_uni_pool_kernel_t<isa, d_type>::init_conf(
     else
         return status::unimplemented;
 
-    // Post-ops: for f32 a single ReLU eltwise is fused into the kernel (see
-    // below); every other post-op (and all f16 post-ops) is executed separately
-    // by the driver.
+    // Post-ops: the pd's post_ops_ok() already accepted only chains this kernel
+    // can fuse in-kernel via the post-op injector (f32: any eltwise + at most one
+    // binary; f16: eltwise-only); everything else went to ref_pooling. The
+    // fuse_eltwise / fuse_binary flags below drive that injector fusion.
+    // with_relu (f32 single-ReLU) is separate — it only feeds the empty-window
+    // fill value (empty_window_value()), not the fusion.
     const auto &po = attr.post_ops_;
     jpp.post_ops = po;
     jpp.with_postops = !po.has_default_values();
-    jpp.with_eltwise = jpp.with_binary = jpp.with_relu = false;
+    jpp.with_relu = false;
+    jpp.fuse_eltwise = jpp.fuse_binary = false;
     jpp.relu_alpha = 0.f;
     if (po.len() == 1) {
         const auto &e = po.entry_[0];
-        if (e.is_eltwise()) {
-            jpp.with_eltwise = true;
-            // ReLU is fused only in the f32 kernel; the f16 kernel has no
-            // fusion, so f16 ReLU falls through to the post-op primitive path.
-            if (e.eltwise.alg == eltwise_relu && d_type == data_type::f32) {
-                jpp.with_relu = true;
-                jpp.relu_alpha = e.eltwise.alpha;
-            }
-        } else if (e.is_binary()) {
-            jpp.with_binary = true;
+        // with_relu is an f32-only flag feeding empty_window_value(); it is
+        // not the fusion mechanism. f16 eltwise (incl ReLU) fuses via
+        // fuse_eltwise in generate_f16.
+        if (e.is_eltwise() && e.eltwise.alg == eltwise_relu
+                && d_type == data_type::f32) {
+            jpp.with_relu = true;
+            jpp.relu_alpha = e.eltwise.alpha;
         }
     }
+    // Post-op chains (any number of eltwise + at most one binary, in attribute
+    // order) are fused in-kernel via the post-op injector. An eltwise-only chain
+    // fuses for both f32 (generate_f32 / interior) and f16 (generate_f16, at
+    // f32). A chain that contains the binary fuses for f32 only, via the
+    // channel-vectorized single-position path (the driver forces it when
+    // fuse_binary) so the rhs broadcast is uniform; the injector loads the rhs
+    // per channel chunk. post_ops_ok already gated the chain shape/algs.
+    const bool inj_ok
+            = injector::jit_uni_postops_injector_t<isa>::post_ops_ok(po);
+    bool po_has_binary = false;
+    for (int i = 0; i < po.len(); i++)
+        if (po.entry_[i].is_binary()) po_has_binary = true;
+    jpp.fuse_eltwise = jpp.with_postops && inj_ok && !po_has_binary;
+    jpp.fuse_binary = jpp.with_postops && inj_ok && po_has_binary
+            && d_type == data_type::f32;
     return status::success;
 }
 
@@ -134,14 +152,32 @@ template <cpu_isa_t isa, data_type_t d_type>
 void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
 #if defined(XBYAK_RISCV_V) && XBYAK_RISCV_V == 1
     const Reg reg_param = a0;
-    const VReg v_mask(0), v_acc(4), v_tmp(8);
+    const VReg v_acc(4), v_tmp(8);
+
+    // Classify a fused binary post-op (if any) to pick the rhs load form. The
+    // driver routes binary through the channel-vectorized single-position path,
+    // so the lanes are channels: per-tensor -> scalar (flw); per-oc [1,C,1,..]
+    // -> [C]-contiguous per-element (vle); full-dst -> per-element strided by the
+    // dst channel stride (vlse), since src1 follows the dst layout.
+    bool bin_scalar = false, bin_strided = false;
+    if (jpp_.fuse_binary)
+        for (int i = 0; i < jpp_.post_ops.len(); i++) {
+            const auto &e = jpp_.post_ops.entry_[i];
+            if (!e.is_binary()) continue;
+            const memory_desc_wrapper s1(e.binary.src1_desc);
+            bin_scalar = s1.nelems() == 1;
+            const bool per_oc = !bin_scalar && s1.nelems() == (dim_t)jpp_.c;
+            bin_strided = !bin_scalar && !per_oc;
+        }
 
     // Save callee-saved regs (s0-s9) holding loop invariants across the nested
     // id/ih/iw/channel loops. f32 always processes a single output position
     // (the nspc interior heavy path uses the shape-baked kernel), so no
     // position loop / row-unrolling is emitted here — keeping per-call overhead
     // minimal for the high-call-count ncsp and boundary paths.
-    const int stack_size = 80; // 10 saved regs, 16B aligned
+    // s10 additionally holds the binary post-op rhs pointer (advanced per
+    // channel chunk) when a binary post-op is fused.
+    const int stack_size = jpp_.fuse_binary ? 96 : 80;
     addi(sp, sp, -stack_size);
     sd(s0, sp, 0);
     sd(s1, sp, 8);
@@ -153,6 +189,7 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
     sd(s7, sp, 56);
     sd(s8, sp, 64);
     sd(s9, sp, 72);
+    if (jpp_.fuse_binary) sd(s10, sp, 80);
 
     // Load params from jit_uni_pooling_args_t
     using p_t = jit_uni_pooling_args_t;
@@ -170,7 +207,6 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
     ld(s3, reg_param, static_cast<int>(offsetof(p_t, w_spatial_byte_stride)));
     flw(fa0, reg_param, static_cast<int>(offsetof(p_t, init_val)));
     flw(ft1, reg_param, static_cast<int>(offsetof(p_t, scale_val)));
-    flw(fa2, reg_param, static_cast<int>(offsetof(p_t, relu_alpha)));
 
     fmv_w_x(fa1, x0); // f_zero = 0.0
 
@@ -178,11 +214,10 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
     slli(s4, t2, 2); // inW_stride_bytes = inW_stride * 4
     slli(s5, t3, 2); // inD_stride_bytes = inD_stride * 4
 
-    // Load with_relu flag (t3 is free after inD_stride consumed into s5)
-    lbu(t3, reg_param, static_cast<int>(offsetof(p_t, with_relu)));
-
     ld(s8, reg_param, static_cast<int>(offsetof(p_t, src_vec_byte_stride)));
     ld(s9, reg_param, static_cast<int>(offsetof(p_t, dst_vec_byte_stride)));
+    if (jpp_.fuse_binary)
+        ld(s10, reg_param, static_cast<int>(offsetof(p_t, post_op_rhs)));
 
     addi(t4, x0, 4); // constant for unit-stride comparison
 
@@ -263,22 +298,24 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
     // Apply avg pooling divide
     if (!is_max_pool_) { vfmul_vf(v_acc, v_acc, ft1); }
 
-    // Apply ReLU post-op (t3 = with_relu, loaded before channel loop)
-    Label relu_done, relu_alpha_zero;
-    beqz(t3, relu_done);
-
-    // Check if alpha == 0
-    fmv_w_x(ft0, x0);
-    feq_s(t2, fa2, ft0);
-    bnez(t2, relu_alpha_zero);
-    // Alpha != 0: mask = v > 0; neg = v * alpha; merge
-    vmfgt_vf(v_mask, v_acc, fa1);
-    vfmul_vf(v_tmp, v_acc, fa2);
-    vmerge_vvm(v_acc, v_tmp, v_acc);
-    j_(relu_done);
-    L(relu_alpha_zero);
-    vfmax_vf(v_acc, v_acc, fa1);
-    L(relu_done);
+    // Apply the fused post-op chain (any number of eltwise + at most one binary,
+    // in attribute order) via the in-kernel injector. Eltwise covers ReLU and
+    // the other supported algs; binary reads its rhs from s10 (host-positioned,
+    // advanced per channel chunk below). This is the f32 path; the f16 kernel
+    // fuses its eltwise chain in generate_f16 (f16 + binary -> ref_pooling).
+    if (jpp_.fuse_eltwise || jpp_.fuse_binary) {
+        eltwise_injector::static_params_t esp(
+                VReg(12), VReg(16), VReg(20), fa3, fa4, t2, /*is_fwd=*/true);
+        // Binary rhs scratch v24/fa5; full-dst uses a strided (vlse) load keyed
+        // on the dst channel stride (s9), per-oc/scalar the contiguous form.
+        binary_injector::static_params_t bsp_contig(VReg(24), fa5, s10);
+        binary_injector::static_params_t bsp_strided(VReg(24), fa5, s10, s9);
+        injector::jit_uni_postops_injector_t<isa> po_inj(this, jpp_.post_ops,
+                esp,
+                jpp_.fuse_binary ? (bin_strided ? &bsp_strided : &bsp_contig)
+                                 : nullptr);
+        po_inj.compute_vector(v_acc.getIdx());
+    }
     // Store result — use vse32_v for unit stride
     {
         Label strided_dst, dst_st_done;
@@ -311,6 +348,15 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
         L(dst_adv_done);
     }
     add(s1, s1, t1);
+    if (jpp_.fuse_binary && !bin_scalar) {
+        // advance the rhs by vl * per-channel byte stride (full-dst: dst channel
+        // stride s9; per-oc: contiguous element size).
+        if (bin_strided)
+            mul(t1, t0, s9);
+        else
+            slli(t1, t0, 2);
+        add(s10, s10, t1);
+    }
     sub(s2, s2, t0); // channels -= vl
 
     j_(ch_loop);
@@ -327,6 +373,7 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f32() {
     ld(s7, sp, 56);
     ld(s8, sp, 64);
     ld(s9, sp, 72);
+    if (jpp_.fuse_binary) ld(s10, sp, 80);
     addi(sp, sp, stack_size);
 
     ret();
@@ -387,6 +434,14 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f16() {
     mv(s11, s1);
     ld(t0, reg_param, static_cast<int>(offsetof(p_t, n_pos)));
     sd(t0, sp, 96);
+
+    // In-kernel eltwise post-op injector (f16 computes the chain at f32). t1 is
+    // a scratch GPR reused across window iterations, free at the inject point.
+    post_ops_t no_po;
+    eltwise_injector::static_params_t esp(
+            VReg(12), VReg(16), VReg(20), fa3, fa4, t1, /*is_fwd=*/true);
+    injector::jit_uni_postops_injector_t<isa> po_inj(
+            this, jpp_.fuse_eltwise ? jpp_.post_ops : no_po, esp);
 
     Label pos_loop, pos_done;
     L(pos_loop);
@@ -466,12 +521,23 @@ void jit_uni_pool_kernel_t<isa, d_type>::generate_f16() {
     j_(id_loop);
     L(id_done);
 
-    // avg: scale (e32/m2) then narrow to f16 (e16/m1).
+    // avg: scale (e32/m2), apply the fused eltwise post-op (at f32), then narrow
+    // to f16 (e16/m1).
     if (!is_max_pool_) {
         vsetvli(t0, s2, SEW::e32, LMUL::m2);
         vfmul_vf(v_acc, v_acc, ft1);
+        if (jpp_.fuse_eltwise) po_inj.compute_vector(v_acc.getIdx());
         vsetvli(t0, s2, SEW::e16, LMUL::m1);
         vfncvt_f_f_w(v_tmp, v_acc);
+    } else if (jpp_.fuse_eltwise) {
+        // max: the accumulator is f16; widen to f32 (v24/m2), apply the eltwise
+        // injector, then narrow back in place so the store path is unchanged.
+        vsetvli(t0, s2, SEW::e16, LMUL::m1);
+        vfwcvt_f_f_v(VReg(24), v_acc);
+        vsetvli(t0, s2, SEW::e32, LMUL::m2);
+        po_inj.compute_vector(24);
+        vsetvli(t0, s2, SEW::e16, LMUL::m1);
+        vfncvt_f_f_w(v_acc, VReg(24));
     }
 
     {
@@ -579,11 +645,9 @@ void jit_uni_pool_interior_kernel_t<isa, d_type>::generate_nspc() {
     const int max_p = (ur_w - 1) * sw + kw; // W positions in the unrolled sweep
     const float init_val = is_max ? -FLT_MAX : 0.0f;
     const float avg_inc_scale = 1.0f / (float)(jpp_.kd * jpp_.kh * jpp_.kw);
-    const bool with_relu = jpp_.with_relu;
-    const float relu_alpha = jpp_.relu_alpha;
 
     const Reg reg_param = a0;
-    const VReg v_mask(0), v_tmp(4 + ur_w);
+    const VReg v_tmp(4 + ur_w);
     auto acc = [&](int j) { return VReg(4 + j); };
 
     // Prologue: save s0-s11.
@@ -630,10 +694,16 @@ void jit_uni_pool_interior_kernel_t<isa, d_type>::generate_nspc() {
         li(t0, fbits(avg_inc_scale));
         fmv_w_x(fa1, t0);
     }
-    if (with_relu && relu_alpha != 0.0f) {
-        li(t0, fbits(relu_alpha));
-        fmv_w_x(fa2, t0);
-    }
+    // In-kernel eltwise post-op injector for the shape-baked f32 nspc interior
+    // kernel: the eltwise chain is applied when fuse_eltwise, else no_po keeps
+    // the injector empty. A fused binary makes the driver skip this interior
+    // kernel (n_blocks=0; every column goes through the channel-vec path), so
+    // only eltwise chains reach here.
+    post_ops_t no_po;
+    eltwise_injector::static_params_t esp(
+            VReg(12), VReg(16), VReg(20), fa4, fa5, t6, /*is_fwd=*/true);
+    injector::jit_uni_postops_injector_t<isa> po_inj(
+            this, jpp_.fuse_eltwise ? jpp_.post_ops : no_po, esp);
 
     Label block_loop, block_done;
     L(block_loop);
@@ -691,19 +761,12 @@ void jit_uni_pool_interior_kernel_t<isa, d_type>::generate_nspc() {
     j_(id_loop);
     L(id_done);
 
-    // Scale (avg) + ReLU + store for each of the ur_w output columns.
+    // Scale (avg) + fused eltwise post-op chain + store for each of the ur_w
+    // output columns.
     mv(a1, a5); // dst_ptr
     for (int j = 0; j < ur_w; j++) {
         if (!is_max) vfmul_vf(acc(j), acc(j), fa1);
-        if (with_relu) {
-            if (relu_alpha == 0.0f) {
-                vfmax_vf(acc(j), acc(j), fa3);
-            } else {
-                vmfgt_vf(v_mask, acc(j), fa3);
-                vfmul_vf(v_tmp, acc(j), fa2);
-                vmerge_vvm(acc(j), v_tmp, acc(j));
-            }
-        }
+        if (jpp_.fuse_eltwise) po_inj.compute_vector(acc(j).getIdx());
         vse32_v(acc(j), a1);
         if (j + 1 < ur_w) add(a1, a1, s5); // dst column stride == w_stride
     }

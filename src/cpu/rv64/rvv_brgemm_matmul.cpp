@@ -14,6 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include <vector>
+
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/memory_desc_wrapper.hpp"
@@ -26,7 +28,6 @@
 #include "cpu/platform.hpp"
 #include "cpu/rv64/jit_generator.hpp"
 #include "cpu/rv64/rvv_brgemm_matmul.hpp"
-#include "cpu/rv64/rvv_postops.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -153,135 +154,6 @@ private:
     int input_typesize_;
 };
 
-// ---------------------------------------------------------------------------
-// JIT kernel: bias + post-ops for one row
-// Processes N elements: load dst, add bias (vector/scalar/none),
-// apply post-op (none/relu), store dst. Vectorized with LMUL=m1.
-// ---------------------------------------------------------------------------
-struct jit_bias_postops_row_t : public jit_generator_t {
-    // bias_type: 0=none, 1=scalar broadcast, 2=per-element vector
-    struct call_params_t {
-        float *row_dst; // offset 0
-        dim_t N; // offset 8
-        const float *bias_ptr; // offset 16
-        int32_t bias_type; // offset 24
-        int32_t postop; // offset 28
-        float postop_alpha; // offset 32
-    };
-
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_bias_postops_row_t)
-
-    jit_bias_postops_row_t() : jit_generator_t("jit_bias_postops_row") {
-        create_kernel();
-    }
-
-    void operator()(const call_params_t *p) const {
-        jit_generator_t::operator()(p);
-    }
-
-protected:
-    void generate() override {
-#if defined(XBYAK_RISCV_V) && XBYAK_RISCV_V == 1
-        using namespace Xbyak_riscv;
-
-        const Reg reg_param = a0;
-        const Reg reg_dst = a1;
-        const Reg reg_N = a2;
-        const Reg reg_bias = a3;
-        const Reg reg_vl = t0;
-        const Reg reg_bytes = t1;
-        const Reg reg_tmp = t2;
-        const Reg reg_bias_type = t3;
-        const Reg reg_postop = t4;
-
-        const FReg f_bias_scalar = fa0;
-        const FReg f_alpha = fa1;
-        const FReg f_zero = fa2;
-        const VReg v_acc(1);
-        const VReg v_bias(2);
-        const VReg v_neg(3);
-        const VReg v_orig(4);
-
-        // Load parameters
-        ld(reg_dst, reg_param, 0);
-        ld(reg_N, reg_param, 8);
-        ld(reg_bias, reg_param, 16);
-        lw(reg_bias_type, reg_param, 24);
-        lw(reg_postop, reg_param, 28);
-
-        // Load alpha for Leaky ReLU
-        flw(f_alpha, reg_param, 32);
-
-        xor_(reg_tmp, reg_tmp, reg_tmp);
-        fmv_w_x(f_zero, reg_tmp);
-
-        Label loop, done;
-        L(loop);
-        beqz(reg_N, done);
-
-        vsetvli(reg_vl, reg_N, SEW::e32, LMUL::m1);
-        vle32_v(v_acc, reg_dst);
-
-        // Bias: 0=none, 1=scalar, 2=vector
-        Label bias_scalar, bias_vector, after_bias;
-        bnez(reg_bias_type, bias_scalar);
-
-        // bias_type == 0: no bias
-        j_(after_bias);
-
-        L(bias_scalar);
-        // Load bias[0] into float register
-        flw(f_bias_scalar, reg_bias, 0);
-        // Check if bias_type == 1 (scalar) or 2 (vector)
-        addi(reg_tmp, reg_bias_type, -1);
-        bnez(reg_tmp, bias_vector);
-
-        // Scalar bias: acc += broadcast
-        vfadd_vf(v_acc, v_acc, f_bias_scalar);
-        j_(after_bias);
-
-        L(bias_vector);
-        // Vector bias: acc += bias[n0..n0+vl)
-        vle32_v(v_bias, reg_bias);
-        vfadd_vv(v_acc, v_acc, v_bias);
-        // Advance bias pointer for next iteration
-        slli(reg_bytes, reg_vl, 2);
-        add(reg_bias, reg_bias, reg_bytes);
-
-        L(after_bias);
-
-        // Post-op: ReLU with negative slope alpha
-        Label postop_done, leaky_relu;
-        beqz(reg_postop, postop_done);
-        vmv_v_v(v_orig, v_acc);
-        fmv_x_w(reg_tmp, f_alpha);
-        bnez(reg_tmp, leaky_relu);
-        vfmax_vf(v_acc, v_acc, f_zero);
-        j_(postop_done);
-
-        L(leaky_relu);
-        vmfgt_vf(VReg(0), v_orig, f_zero);
-        vfmul_vf(v_neg, v_orig, f_alpha);
-        vmerge_vvm(v_acc, v_neg, v_orig);
-        L(postop_done);
-
-        // Store result
-        vse32_v(v_acc, reg_dst);
-
-        // Advance dst pointer
-        slli(reg_bytes, reg_vl, 2);
-        add(reg_dst, reg_dst, reg_bytes);
-        sub(reg_N, reg_N, reg_vl);
-        j_(loop);
-
-        L(done);
-        ret();
-#else
-        ret();
-#endif
-    }
-};
-
 status_t rvv_brgemm_matmul_t::pd_t::init(engine_t *engine) {
     using smask_t = primitive_attr_t::skip_mask_t;
 
@@ -319,10 +191,24 @@ status_t rvv_brgemm_matmul_t::pd_t::init(engine_t *engine) {
     VDISPATCH_MATMUL(attr()->has_default_values(smask_t::post_ops, f32),
             VERBOSE_UNSUPPORTED_ATTR);
 
-    VDISPATCH_MATMUL(rvv_postops_t::post_ops_ok(attr()->post_ops_),
+    // Resolve primary + post-op binary src1 formats before the post-op check:
+    // a post-op binary src1 may be format_any and must be matched to dst before
+    // binary_broadcast_ok() inspects its layout (matches x64).
+    VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_MATMUL(attr_.set_default_formats(dst_md(0)) == status::success,
             VERBOSE_UNSUPPORTED_POSTOP);
 
-    VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+    // Post-ops applied per output row (length N) by the unified injector
+    // kernel: supported eltwise chain + any number of scalar/per-N binaries.
+    const dim_t N_po = dst_mdw.dims()[dst_mdw.ndims() - 1];
+    VDISPATCH_MATMUL(jit_uni_postops_kernel_t::post_ops_supported(
+                             attr()->post_ops_, N_po),
+            VERBOSE_UNSUPPORTED_POSTOP);
+    // A non-scalar binary rhs must be strict per-N (broadcast over M and batch);
+    // per-M [M,1] (slips past nelems==N when M==N) must fall back.
+    VDISPATCH_MATMUL(jit_uni_postops_kernel_t::binary_per_last_dim_ok(
+                             attr()->post_ops_, N_po),
+            VERBOSE_UNSUPPORTED_POSTOP);
 
     const int ndims = src_mdw.ndims();
     const int wei_ndims = wei_mdw.ndims();
@@ -426,9 +312,23 @@ status_t rvv_brgemm_matmul_t::pd_t::init(engine_t *engine) {
     CHECK(brgemm_kernel_create(&kernel, brg_desc));
     brg_kernel_.reset(kernel);
 
+    // Create JIT kernels for pack_a_tile and the per-row bias + post-op chain
+    // (the latter replaces the bespoke jit_bias_postops_row_t).
     // pack_a_tile is dtype-aware; bias+postops touch only the f32 dst.
     pack_kernel_.reset(new jit_pack_a_tile_t(input_typesize_));
-    bias_postops_kernel_.reset(new jit_bias_postops_row_t());
+    {
+        const memory_desc_wrapper bias_d(desc()->bias_desc);
+        jit_uni_postops_kernel_t::conf_t conf;
+        conf.dst_dt = f32;
+        conf.with_bias = !bias_d.is_zero();
+        if (conf.with_bias) {
+            const int bn = bias_d.ndims();
+            conf.bias_per_element
+                    = !(bias_d.nelems() == 1 || bias_d.dims()[bn - 1] == 1);
+        }
+        CHECK(jit_uni_postops_kernel_t::create(
+                postops_kernel_, attr()->post_ops_, conf));
+    }
 
     init_scratchpad();
 
@@ -464,7 +364,7 @@ status_t rvv_brgemm_matmul_t::execute(const exec_ctx_t &ctx) const {
 
     const auto *brg_kernel = pd()->brg_kernel_.get();
     const auto *pack_kernel = pd()->pack_kernel_.get();
-    const auto *bias_postops_kernel = pd()->bias_postops_kernel_.get();
+    const auto *postops_kernel = pd()->postops_kernel_.get();
 
     // Packing workspace from scratchpad. Packed once per M-tile, then the
     // brgemm kernel is called per K-block with offset into the buffer.
@@ -520,13 +420,20 @@ status_t rvv_brgemm_matmul_t::execute(const exec_ctx_t &ctx) const {
     const dim_t *src_dims_ptr = src_d.dims();
     const dim_t dst_batch_stride = M * N;
 
-    int32_t postop = 0;
-    float postop_alpha = 0.f;
-    if (post_ops.len() > 0 && post_ops.entry_[0].is_eltwise()
-            && post_ops.entry_[0].eltwise.alg == alg_kind::eltwise_relu) {
-        postop = 1;
-        postop_alpha = post_ops.entry_[0].eltwise.alpha;
-    }
+    // Binary post-op src1 bases, one per binary in chain order (scalar or per-N;
+    // each broadcasts over M/batch so the same array serves every row). Empty
+    // when the chain has no binary entry. Shift each base by src1's own offset0
+    // (off_l(0)) so a submemory rhs is read from its logical origin, not the
+    // buffer base — the kernel only adds the in-row column offset on top.
+    std::vector<const void *> po_rhs;
+    for (int i = 0; i < post_ops.len(); i++)
+        if (post_ops.entry_[i].is_binary()) {
+            const memory_desc_wrapper s1_d(post_ops.entry_[i].binary.src1_desc);
+            const auto *base = static_cast<const char *>(ctx.host_ptr(
+                    DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_SRC_1));
+            po_rhs.push_back(base + s1_d.off_l(0) * sizeof(float));
+        }
+    const void *const *po_rhs_arr = po_rhs.empty() ? nullptr : po_rhs.data();
 
     parallel_nd(batch, [&](dim_t b) {
         float *dst_base = dst + b * dst_batch_stride;
@@ -550,11 +457,9 @@ status_t rvv_brgemm_matmul_t::execute(const exec_ctx_t &ctx) const {
 
             float *row_dst = dst_base + m * N;
 
-            int32_t bias_type = 0; // 0=none
             const float *bias_ptr = nullptr;
             if (bias) {
                 if (bias_d.nelems() == 1) {
-                    bias_type = 1; // scalar broadcast
                     bias_ptr = bias;
                 } else {
                     size_t base_bias_off = 0;
@@ -568,21 +473,17 @@ status_t rvv_brgemm_matmul_t::execute(const exec_ctx_t &ctx) const {
                         }
                     }
                     bias_ptr = bias + base_bias_off;
-                    if (bias_dims[bias_ndims - 1] == 1)
-                        bias_type = 1; // scalar
-                    else
-                        bias_type = 2; // vector
                 }
             }
 
-            jit_bias_postops_row_t::call_params_t bp;
-            bp.row_dst = row_dst;
-            bp.N = N;
-            bp.bias_ptr = bias_ptr;
-            bp.bias_type = bias_type;
-            bp.postop = postop;
-            bp.postop_alpha = postop_alpha;
-            (*bias_postops_kernel)(&bp);
+            // Fused bias + post-op chain over this output row (length N).
+            jit_uni_postops_kernel_t::call_params_t cp;
+            cp.dst = row_dst;
+            cp.bias = bias_ptr;
+            cp.rhs = po_rhs_arr;
+            cp.off0 = 0; // per-N rhs starts at column 0 of every row
+            cp.len = N;
+            (*postops_kernel)(&cp);
         }
     });
 

@@ -22,6 +22,7 @@
 #include "common/primitive_attr.hpp"
 
 #include "cpu/cpu_pooling_pd.hpp"
+#include "cpu/rv64/injectors/jit_uni_postops_injector.hpp"
 #include "cpu/rv64/jit_generator.hpp"
 #include "cpu/rv64/jit_primitive_conf.hpp"
 
@@ -39,7 +40,7 @@ namespace rv64 {
 template <cpu_isa_t isa, impl::data_type_t d_type>
 struct jit_uni_pool_kernel_t : public jit_generator_t {
 
-    jit_uni_pool_kernel_t(alg_kind_t alg);
+    jit_uni_pool_kernel_t(const jit_pool_conf_t &jpp);
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_uni_pool_kernel_t)
 
@@ -56,23 +57,24 @@ protected:
     void generate() override;
 
 private:
+    jit_pool_conf_t jpp_;
     bool is_max_pool_;
     void generate_f32();
     // f16 path: max accumulates in f16; avg widens to f32 (vfwadd_wv), scales,
-    // and narrows back to f16 (vfncvt). Requires the zvfh extension. Post-ops
-    // are not fused in this kernel; f16 post-ops (incl. ReLU) run as separate
-    // primitives via the driver's rvv_postops_t path.
+    // and narrows back to f16 (vfncvt). Requires the zvfh extension. Eltwise
+    // post-ops are fused here (computed at f32 before narrowing); f16 binary
+    // post-ops fall back to ref_pooling.
     void generate_f16();
 };
 
 // Shape-baked forward pooling kernel for the interior (full-kw) region of an
 // nspc row (f32 only; f16 uses the agnostic kernel above). kw, stride_w, ur_w,
-// the algorithm, ReLU, and the avg_include scale are baked into the generated
-// code; the W window is fully unrolled and ur_w output columns share each
-// loaded input vector (ARM max_step/avg_step style). Base pointers, the VLA
-// channel count, the runtime H/D extents, the element strides (passed, not
-// baked, so 64-bit strides stay correct), and the avg_exclude scale are passed
-// at call time.
+// the algorithm, the fused eltwise post-op chain, and the avg_include scale are
+// baked into the generated code; the W window is fully unrolled and ur_w output
+// columns share each loaded input vector (ARM max_step/avg_step style). Base
+// pointers, the VLA channel count, the runtime H/D extents, the element strides
+// (passed, not baked, so 64-bit strides stay correct), and the avg_exclude
+// scale are passed at call time.
 template <cpu_isa_t isa, impl::data_type_t d_type>
 struct jit_uni_pool_interior_kernel_t : public jit_generator_t {
 

@@ -16,6 +16,7 @@
 *******************************************************************************/
 
 #include <atomic>
+#include <vector>
 
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
@@ -70,6 +71,25 @@ status_t riscv_gemm_convolution_fwd_t::execute_forward_thr_nspc(
         const data_t *src_base, const data_t *wei_base, const data_t *bia_base,
         data_t *dst_base, const memory_tracking::grantor_t &scratchpad) const {
     const conv_gemm_conf_t &jcp = pd()->jcp_;
+
+    // Binary post-op src1 bases (scalar or per-oc), one per binary in chain
+    // order. The contiguous oc-slice reads each at base + channel-base off0, so
+    // the same array serves every slice. Each base is shifted by src1's own
+    // offset0 (off_l(0)) so a submemory rhs reads from its logical origin (the
+    // per-slice channel-base off0 is added by the kernel on top). Empty unless
+    // the in-kernel post-op path is active and the chain has a binary entry.
+    std::vector<const void *> po_rhs;
+    if (jit_postops_kernel_ && jcp.with_binary) {
+        const auto &po = pd()->attr()->post_ops_;
+        for (int i = 0; i < po.len(); i++)
+            if (po.entry_[i].is_binary()) {
+                const memory_desc_wrapper s1_d(po.entry_[i].binary.src1_desc);
+                const auto *base = static_cast<const char *>(ctx.host_ptr(
+                        DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_SRC_1));
+                po_rhs.push_back(base + s1_d.off_l(0) * sizeof(float));
+            }
+    }
+    const void *const *po_rhs_arr = po_rhs.empty() ? nullptr : po_rhs.data();
 
     // Src Format: mb-spatial-groups-input_channels
     const dim_t src_mb_stride = jcp.id * jcp.ih * jcp.iw * jcp.ngroups * jcp.ic;
@@ -199,7 +219,24 @@ status_t riscv_gemm_convolution_fwd_t::execute_forward_thr_nspc(
                             }
                         }
 
-                        if (jcp.with_eltwise || jcp.with_binary) {
+                        if ((jcp.with_eltwise || jcp.with_binary)
+                                && jit_postops_kernel_) {
+                            // Injector chain (eltwise + scalar/per-oc binary)
+                            // over the contiguous oc-slice dst_arr[start_oc ..
+                            // end_oc]; the per-channel bias was already applied
+                            // above. A per-oc binary rhs is read at base + off0,
+                            // where off0 is the slice's channel-base byte offset
+                            // (group g, local channel start_oc); scalars ignore
+                            // it.
+                            jit_uni_postops_kernel_t::call_params_t cp;
+                            cp.dst = dst_arr + start_oc;
+                            cp.bias = nullptr;
+                            cp.rhs = po_rhs_arr;
+                            cp.off0 = (dim_t)(((size_t)g * jcp.oc + start_oc)
+                                    * sizeof(float));
+                            cp.len = (dim_t)(end_oc - start_oc + 1);
+                            (*jit_postops_kernel_)(&cp);
+                        } else if (jcp.with_eltwise || jcp.with_binary) {
                             bool fast_relu_done = false;
                             if (jcp.with_eltwise && jcp.post_ops.len() == 1) {
                                 // fast branch for ReLU case
