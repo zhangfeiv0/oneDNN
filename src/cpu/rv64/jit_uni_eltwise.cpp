@@ -62,7 +62,6 @@ void emit_eltwise_loop(jit_generator_t *h, alg_kind_t alg, float alpha,
     };
 
     const bool is_s8 = dt == data_type::s8;
-    const bool is_u8 = dt == data_type::u8;
 
     Label loop, done;
     h->L(loop);
