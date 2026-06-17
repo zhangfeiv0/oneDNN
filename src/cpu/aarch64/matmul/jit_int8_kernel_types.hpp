@@ -66,12 +66,17 @@ struct brg_int8_t {
     int na, nb;
     int m_tail, n_tail, k_tail;
     int is_m_tail, is_k_tail, is_n_tail, is_zp_cal;
+    data_type_t dst_dt;
+    const int acc_dt_sz = sizeof(float);
     int dst_dt_sz;
     bool is_s8, is_u8_s8;
     bool is_bias;
     bool with_scales;
+    bool with_src_scales;
+    bool with_wei_scales;
     bool with_dst_scales;
     bool is_oc_scales;
+    bool is_per_m_scales = false;
     jit_int8_broadcast_t zp_type_a = jit_int8_broadcast_t::none;
     jit_int8_broadcast_t zp_type_b = jit_int8_broadcast_t::none;
     jit_int8_broadcast_t zp_type_c = jit_int8_broadcast_t::none;
@@ -83,8 +88,10 @@ struct brg_int8_t {
 
 struct call_params_t {
     const uint8_t *src, *wei;
-    float *dst;
+    uint8_t *dst;
     const float *bias, *scales, *dst_scales;
+    const float *src_scales; // optional per-row src logical-M scales
+    const float *wei_scales; // optional kernel-ready weight scales
     dim_t M, K, N;
     char *buf_B_ptr_;
     int *na, *nb;

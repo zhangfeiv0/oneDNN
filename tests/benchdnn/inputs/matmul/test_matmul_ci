@@ -76,6 +76,14 @@
 --batch=shapes_2d
 --batch=shapes_3d
 
+# Int8 src logical-M scales
+--reset --dt=s8:s8:f32 --attr-scales=src:1 32x64:64x48
+--reset --dt=s8:s8:bf16 --attr-scales=src:1+wei:0:2 17x64:64x19
+--reset --dt=u8:s8:f32 --attr-scales=src:1+wei:2 32x64:64x48
+--reset --dt=s8:s8:f32 --attr-scales=src:2 3x17x64:3x64x19
+--reset --dt=s8:s8:bf16 --attr-scales=src:2+wei:0:2 5x32x64:5x64x48
+--reset --dt=u8:s8:f32 --attr-scales=src:2+wei:4 3x17x64:3x64x19
+
 # Zero-points check
 --reset
 --dt=s8:s8:s8,u8:s8:f32,u8:s8:bf16,s8:s8:f16,u8:s8:f16
