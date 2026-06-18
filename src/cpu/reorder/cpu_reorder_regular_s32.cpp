@@ -34,6 +34,9 @@ const impl_list_map_t &regular_s32_impl_list_map() {
             DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_blk_reorder_t))
             DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_uni_reorder_t))
 
+            DNNL_RV64_ONLY(CPU_REORDER_INSTANCE(rv64::jit_blk_reorder_t))
+            DNNL_RV64_ONLY(CPU_REORDER_INSTANCE(rv64::jit_uni_reorder_t))
+
             REG_FAST_DIRECT_COPY(s32, f32)
             REG_FAST_DIRECT_COPY(s32, s32)
             REG_FAST_DIRECT_COPY(s32, s8)
