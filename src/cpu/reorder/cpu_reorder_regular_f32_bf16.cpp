@@ -38,6 +38,7 @@ const impl_list_map_t &regular_f32_bf16_impl_list_map() {
 
             DNNL_AARCH64_ACL_ONLY(CPU_REORDER_INSTANCE(aarch64::acl_reorder_fwd_t))
             DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_uni_reorder_t))
+            DNNL_RV64_ONLY(CPU_REORDER_INSTANCE(rv64::jit_uni_reorder_t))
 
             DNNL_NON_X64_ONLY(REG_SR(f32, oihw, bf16, OIhw8i16o2i, fmt_order::keep))
             DNNL_NON_X64_ONLY(REG_SR(f32, goihw, bf16, gOIhw8i16o2i, fmt_order::keep))
