@@ -134,14 +134,16 @@ bool jit_uni_reorder_kernel_f32_t::applicable(const prb_t &p) {
             && utils::one_of(p.beta, 0.f, 1.f) && prb_has_small_strides(p);
     if (!ok) return false;
 
-    // s32 -> s32 with any arithmetic (scales / zero-points / sum) must stay
-    // integer-exact: the kernel computes through f32, which rounds s32 values
-    // beyond 2^24, diverging from the integer-exact reference. Pure s32 -> s32
-    // copy (no attrs) is unaffected (bit-exact). Defer the rest to reference.
+    // s32 -> s32 with any arithmetic (scales / zero-points / sum /
+    // scale-adjust) must stay integer-exact: the kernel computes through f32,
+    // which rounds s32 values beyond 2^24, diverging from the integer-exact
+    // reference. Pure s32 -> s32 copy (no attrs) is unaffected (bit-exact).
+    // Defer the rest to reference.
     if (p.itype == data_type::s32 && p.otype == data_type::s32
             && (p.req_src_zp || p.req_dst_zp
                     || p.src_scale_type != scale_type_t::NONE
-                    || p.dst_scale_type != scale_type_t::NONE || p.beta != 0.f))
+                    || p.dst_scale_type != scale_type_t::NONE || p.beta != 0.f
+                    || p.scale_adjust != 1.f))
         return false;
 
     // Tail / zero-padding: JIT only the common single-inner-tail shape, i.e. the
