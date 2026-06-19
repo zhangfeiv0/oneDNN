@@ -212,6 +212,15 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         const memory_desc_t *dst_md) {
     VDISPATCH_REORDER_IC(impl::is_dense_format_kind({src_md, dst_md}),
             VERBOSE_UNSUPPORTED_SPARSE_CFG);
+
+    const auto &zp = attr->zero_points_;
+    const auto scalar_or_default_zp = [&](int arg) {
+        return zp.has_default_values(arg) || zp.get_mask(arg) == 0;
+    };
+    VDISPATCH_REORDER_IC(scalar_or_default_zp(DNNL_ARG_SRC)
+                    && scalar_or_default_zp(DNNL_ARG_DST),
+            VERBOSE_UNSUPPORTED_ZP_CFG);
+
     auto prb = tr::prb_t();
 
     status_t prb_init_status = prb_init(prb, *src_md, *dst_md, attr);
