@@ -102,10 +102,11 @@ onednn_option(ARCH_OPT_FLAGS "HostOpts"
     - For GNU* Compiler Collection and Clang, the default option is `-msse4.1` which
       behaves similarly to the description above.
 
-    - For Clang and GCC compilers on RISC-V architecture this option accepts `-march=<ISA-string>` flag
-      to control whether or not oneDNN should be compiled with RVV Intrinsics. Use this option with
-      `-march=rv64gc` or `-march=rv64gcv` value to compile oneDNN with and without RVV Intrinsics respectively.
-      If the option is not provided, CMake will decide based on the active toolchain and compiler flags.
+    - For Clang and GCC compilers on RISC-V architecture this option accepts the
+      `-march=<ISA-string>` flag. The RV64 backend emits vector kernels at runtime
+      and does not use this option to include or exclude JIT sources. The default
+      is the portable `-march=rv64gc` baseline; an explicit value such as
+      `-march=rv64gcv` allows the compiler to generate code for that target ISA.
 
     - For all other cases there are no special optimizations flags.
 

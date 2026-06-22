@@ -29,6 +29,7 @@
 #include "cpu/cpu_convolution_pd.hpp"
 #include "cpu/gemm/gemm.hpp"
 #include "cpu/primitive_attr_postops.hpp"
+#include "cpu/rv64/cpu_isa_traits.hpp"
 #include "cpu/rv64/jit_uni_postops_kernel.hpp"
 #include "cpu/rv64/rvv_gemm_convolution_utils.hpp"
 
@@ -47,6 +48,9 @@ struct riscv_gemm_convolution_fwd_t : public primitive_t {
         status_t init(engine_t *engine) {
             using namespace data_type;
 
+            // The GEMM path is JIT-emitted (rvv_gemm_f32); on the rv64gc
+            // baseline a non-V CPU must defer to the next implementation.
+            VDISPATCH_CONV(mayiuse(v), VERBOSE_UNSUPPORTED_ISA);
             VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
 
             if (with_bias()) {

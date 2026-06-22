@@ -37,8 +37,12 @@ struct rvv_layer_normalization_fwd_t : public primitive_t {
         using cpu_layer_normalization_fwd_pd_t::
                 cpu_layer_normalization_fwd_pd_t;
 
-        DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_lnorm:", v, ""),
+        DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_lnorm:", isa_, ""),
                 rvv_layer_normalization_fwd_t);
+
+        // f16 runs the Zvfh path (vfwcvt/vfncvt); f32 stays on V. Drives the
+        // verbose impl name (jit_lnorm:rvv vs jit_lnorm:rvv_zvfh).
+        cpu_isa_t isa_ = v;
 
         status_t init(engine_t *engine) {
             using namespace data_type;
@@ -55,6 +59,12 @@ struct rvv_layer_normalization_fwd_t : public primitive_t {
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_LNORM(
                     (stat_md()->data_type == f32), VERBOSE_UNSUPPORTED_DT);
+
+            // Set the ISA that drives the impl name (jit_lnorm:rvv vs
+            // jit_lnorm:rvv_zvfh) once the dtype is validated and before any
+            // mayiuse()/has_data_type_support() rejection, so a declined f16 PD
+            // is not mislabeled jit_lnorm:rvv in the dispatch log.
+            isa_ = (src_md()->data_type == f16) ? zvfh : v;
 
             if (src_md()->data_type == f16) {
                 VDISPATCH_LNORM(platform::has_data_type_support(f16),

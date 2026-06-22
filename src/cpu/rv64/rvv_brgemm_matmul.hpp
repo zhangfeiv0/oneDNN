@@ -28,6 +28,7 @@
 #include "cpu/matmul/cpu_matmul_pd.hpp"
 
 #include "cpu/rv64/brgemm/brgemm.hpp"
+#include "cpu/rv64/cpu_isa_traits.hpp"
 #include "cpu/rv64/jit_uni_postops_kernel.hpp"
 
 namespace dnnl {
@@ -42,7 +43,8 @@ struct rvv_brgemm_matmul_t : public primitive_t {
     struct pd_t : public ::dnnl::impl::cpu::matmul::cpu_matmul_pd_t {
         using ::dnnl::impl::cpu::matmul::cpu_matmul_pd_t::cpu_matmul_pd_t;
 
-        DECLARE_COMMON_PD_T("brgemm:rvv", rvv_brgemm_matmul_t);
+        DECLARE_COMMON_PD_T(
+                JIT_IMPL_NAME_HELPER("brgemm:", isa_, ""), rvv_brgemm_matmul_t);
 
         status_t init(engine_t *engine);
 
@@ -57,6 +59,9 @@ struct rvv_brgemm_matmul_t : public primitive_t {
         bool weights_are_broadcast_ = false;
         // Input element size in bytes (4=f32, 2=bf16/f16). dst is always f32.
         int input_typesize_ = 4;
+        // Kernel isa from the input dtype (f32->v / f16->zvfh / bf16->zvfbfwma);
+        // drives the impl name (brgemm:rvv / brgemm:rvv_zvfh / ..._zvfbfwma).
+        cpu_isa_t isa_ = v;
 
     private:
         void init_scratchpad();

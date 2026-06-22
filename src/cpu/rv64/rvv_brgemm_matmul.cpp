@@ -179,6 +179,10 @@ status_t rvv_brgemm_matmul_t::pd_t::init(engine_t *engine) {
     const auto src_dt = src_mdw.data_type();
     const auto wei_dt = wei_mdw.data_type();
     const bool same_in_dt = src_dt == wei_dt;
+    // Derive the kernel ISA from the input dtype now, before the dtype/ISA gate
+    // below, so a declined bf16/f16 PD reports brgemm:rvv_zvfbfwma / _zvfh in the
+    // dispatch log instead of the default brgemm:rvv.
+    isa_ = (src_dt == f16) ? zvfh : (src_dt == bf16) ? zvfbfwma : v;
     const bool in_dt_ok = same_in_dt
             && (src_dt == f32 || (src_dt == bf16 && mayiuse(zvfbfwma))
                     || (src_dt == f16 && mayiuse(zvfh)));

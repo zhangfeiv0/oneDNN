@@ -42,10 +42,13 @@ struct rvv_softmax_conf_t {
 struct rvv_softmax_fwd_t : public primitive_t {
     struct pd_t : public cpu_softmax_fwd_pd_t {
         using cpu_softmax_fwd_pd_t::cpu_softmax_fwd_pd_t;
-        DECLARE_COMMON_PD_T("RISCV64GCV", rvv_softmax_fwd_t);
+        DECLARE_COMMON_PD_T(
+                JIT_IMPL_NAME_HELPER("jit:", isa_, ""), rvv_softmax_fwd_t);
 
         rvv_softmax_conf_t rsp_;
         bool use_jit_ = false;
+        // f32 uses isa v, f16 uses Zvfh (vfwcvt/vfncvt); drives the impl name.
+        cpu_isa_t isa_ = v;
 
         status_t init(engine_t *engine) {
             UNUSED(engine);
@@ -72,6 +75,10 @@ struct rvv_softmax_fwd_t : public primitive_t {
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_SOFTMAX(src_md()->data_type == dst_md()->data_type,
                     VERBOSE_UNSUPPORTED_DT);
+            // f16 runs the Zvfh widening/narrowing path; f32 stays on V. Set the
+            // ISA that drives the impl name (jit:rvv vs jit:rvv_zvfh) before any
+            // mayiuse() rejection, so a declined f16 PD is not mislabeled jit:rvv.
+            isa_ = is_f16 ? zvfh : v;
             VDISPATCH_SOFTMAX(mayiuse(v), VERBOSE_UNSUPPORTED_ISA);
             if (is_f16) {
                 VDISPATCH_SOFTMAX(mayiuse(zvfh), VERBOSE_UNSUPPORTED_ISA);

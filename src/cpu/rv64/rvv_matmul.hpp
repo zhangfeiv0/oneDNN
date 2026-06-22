@@ -21,6 +21,7 @@
 #include "common/primitive.hpp"
 #include "common/utils.hpp"
 #include "cpu/matmul/cpu_matmul_pd.hpp"
+#include "cpu/rv64/cpu_isa_traits.hpp"
 #include "cpu/rv64/jit_uni_postops_kernel.hpp"
 
 namespace dnnl {
@@ -33,13 +34,17 @@ struct rvv_matmul_t : public primitive_t {
     struct pd_t : public ::dnnl::impl::cpu::matmul::cpu_matmul_pd_t {
         using ::dnnl::impl::cpu::matmul::cpu_matmul_pd_t::cpu_matmul_pd_t;
 
-        DECLARE_COMMON_PD_T("RISCV64GCV", rvv_matmul_t)
+        DECLARE_COMMON_PD_T("jit:rvv", rvv_matmul_t)
 
         static constexpr data_type_t d_type = data_type::f32;
 
         status_t init(engine_t *engine) {
             UNUSED(engine);
             using smask_t = primitive_attr_t::skip_mask_t;
+
+            // Vector kernels are JIT-emitted; the rv64gc baseline build means a
+            // non-V CPU must defer to the next (reference) implementation.
+            VDISPATCH_MATMUL(mayiuse(v), VERBOSE_UNSUPPORTED_ISA);
 
             const memory_desc_wrapper src_mdw(src_md(0));
             const memory_desc_wrapper weights_mdw(weights_md(0));
