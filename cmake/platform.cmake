@@ -120,89 +120,20 @@ if(DNNL_WITH_SYCL)
 endif()
 
 if (DNNL_TARGET_ARCH STREQUAL "RV64")
-    # Check if the RVV Intrinsics can be compiled with the current toolchain and flags
-    set(ARCH_SIMD_TEST_FLAGS "-march=rv64gcv")
-    set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
-    set(CMAKE_REQUIRED_FLAGS "${ARCH_SIMD_TEST_FLAGS}")
-    include(CheckCXXSourceCompiles)
-    check_cxx_source_compiles("#if !defined(__riscv) || !defined(__riscv_v)
-                               #error \"RISC-V or vector extension(RVV) is not supported by the compiler\"
-                               #endif
-
-                               #if defined(__riscv_v_intrinsic) && __riscv_v_intrinsic < 12000
-                               #error \"RISC-V intrinsics v0.12 or higher is required\"
-                               #endif
-
-                               #include <riscv_vector.h>
-                               int main() {
-                                return 0;
-                               };"
-                               CAN_COMPILE_RVV_INTRINSICS
-    )
-    
-    set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
-    # Set CAN_COMPILE_RVV_INTRINSICS to TRUE / FALSE instead of 1 / "" (Undefined)
-    if (CAN_COMPILE_RVV_INTRINSICS)
-        # RVV is supported, now check for Zvfh (which depends on V)
-        set(ARCH_SIMD_TEST_FLAGS "-march=rv64gcv_zvfh")
-        set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
-        set(CMAKE_REQUIRED_FLAGS "${ARCH_SIMD_TEST_FLAGS}")
-        check_cxx_source_compiles("#include <riscv_vector.h>
-                                   #ifndef __riscv_zvfh
-                                   #error \"Zvfh extension is not supported by the compiler\"
-                                   #endif   
-                                   int main() {
-                                    vfloat16m1_t a;
-                                    return 0; 
-                                   };"
-                                   CAN_COMPILE_ZVFH_INTRINSICS
-        )
-        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
-
-        set(CAN_COMPILE_RVV_INTRINSICS TRUE)
-
-        # If explicitly passed DNNL_ARCH_OPT_FLAGS without V or Zvfh in the -march 
-        # string, disable their code paths even if the toolchain supports them.
-        if (DEFINED DNNL_ARCH_OPT_FLAGS AND DNNL_ARCH_OPT_FLAGS MATCHES "-march=")
-            string(FIND "${DNNL_ARCH_OPT_FLAGS}" "gcv" _dnnl_rv64_v_pos)
-            string(FIND "${DNNL_ARCH_OPT_FLAGS}" "zvfh" _dnnl_rv64_zvfh_pos)
-            if (_dnnl_rv64_v_pos EQUAL -1)
-                set(CAN_COMPILE_RVV_INTRINSICS FALSE)
-                set(CAN_COMPILE_ZVFH_INTRINSICS FALSE)
-            elseif (_dnnl_rv64_zvfh_pos EQUAL -1)
-                set(CAN_COMPILE_ZVFH_INTRINSICS FALSE)
-            endif()
-        endif()
-
-        if (CAN_COMPILE_ZVFH_INTRINSICS)
-            set(RV64_MARCH_FLAG "-march=rv64gcv_zvfh")
-        elseif (CAN_COMPILE_RVV_INTRINSICS)
-            set(RV64_MARCH_FLAG "-march=rv64gcv")
-        else()
-            set(RV64_MARCH_FLAG "-march=rv64gc")
-        endif()
+    # The RV64 backend is pure JIT: all vector kernels are emitted at runtime
+    # (Xbyak_riscv) and selected through mayiuse() CPU detection (V / Zvfh /
+    # Zvfbfwma), independent of the compiler's -march. The library is therefore
+    # built for the rv64gc baseline so a single binary runs on both V-capable and
+    # non-V RV64GC hardware; the JIT supplies the vector code paths when the CPU
+    # reports them. Pass DNNL_ARCH_OPT_FLAGS="-march=<isa>" to override (e.g.
+    # -march=rv64gcv to let the compiler auto-vectorize the reference/driver code
+    # on a V-only deployment).
+    set(RV64_MARCH_FLAG "-march=rv64gc")
+    if(DNNL_ARCH_OPT_FLAGS STREQUAL "HostOpts")
+        message(STATUS "Using default RV64 march flag: ${RV64_MARCH_FLAG} (portable baseline; JIT selects V/Zvfh at runtime; override with -DDNNL_ARCH_OPT_FLAGS=\"-march=...\")")
     else()
-        # RVV is not supported, so Zvfh is also not supported
-        set(CAN_COMPILE_RVV_INTRINSICS FALSE)
-        set(CAN_COMPILE_ZVFH_INTRINSICS FALSE)
-        set(RV64_MARCH_FLAG "-march=rv64gc")
+        message(STATUS "Using RV64 arch opt flags from DNNL_ARCH_OPT_FLAGS: ${DNNL_ARCH_OPT_FLAGS}")
     endif()
-
-    set(DNNL_RISCV_USE_RVV_INTRINSICS ${CAN_COMPILE_RVV_INTRINSICS})
-    if (${DNNL_RISCV_USE_RVV_INTRINSICS})
-        add_definitions(-DDNNL_RISCV_USE_RVV_INTRINSICS)
-    endif()
-
-    set(DNNL_RISCV_USE_ZVFH_INTRINSICS ${CAN_COMPILE_ZVFH_INTRINSICS})
-    if (${DNNL_RISCV_USE_ZVFH_INTRINSICS})
-        add_definitions(-DDNNL_RISCV_USE_ZVFH_INTRINSICS)
-    endif()
-
-    message(STATUS "Can compile RVV Intrinsics: ${CAN_COMPILE_RVV_INTRINSICS}")
-    message(STATUS "Can compile Zvfh Intrinsics: ${CAN_COMPILE_ZVFH_INTRINSICS}")
-    message(STATUS "DNNL_RISCV_USE_RVV_INTRINSICS: ${DNNL_RISCV_USE_RVV_INTRINSICS}")
-    message(STATUS "DNNL_RISCV_USE_ZVFH_INTRINSICS: ${DNNL_RISCV_USE_ZVFH_INTRINSICS}")
-    message(STATUS "Using RV64 march flag: ${RV64_MARCH_FLAG}")
 endif()
 
 if(MSVC)

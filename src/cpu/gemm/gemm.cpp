@@ -48,10 +48,9 @@ using namespace dnnl::impl::cpu::ppc64;
 #elif DNNL_S390X
 #include "cpu/s390x/gemm.h"
 #elif DNNL_RV64
-#if defined(DNNL_RISCV_USE_RVV_INTRINSICS)
+#include "cpu/rv64/cpu_isa_traits.hpp"
 #include "cpu/rv64/gemm/rvv_gemm_f32.hpp"
 using namespace dnnl::impl::cpu::rv64;
-#endif
 #endif
 
 namespace dnnl {
@@ -150,9 +149,13 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
     }
 #endif
 
-#if DNNL_RV64 && defined(DNNL_RISCV_USE_RVV_INTRINSICS)
-    return rvv_gemm_f32(
-            transa, transb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, bias);
+#if DNNL_RV64
+    // Pure-JIT RVV f32 GEMM. The library is built for the rv64gc baseline, so
+    // gate on runtime V detection and fall through to the portable reference
+    // GEMM when the running CPU has no vector unit.
+    if (mayiuse(v))
+        return rvv_gemm_f32(transa, transb, M, N, K, alpha, A, lda, B, ldb,
+                beta, C, ldc, bias);
 #endif
 
     return ref_gemm<float>(

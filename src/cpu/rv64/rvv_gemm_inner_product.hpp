@@ -38,7 +38,7 @@ struct rvv_gemm_inner_product_fwd_t : public primitive_t {
     struct pd_t : public cpu_inner_product_fwd_pd_t {
         using cpu_inner_product_fwd_pd_t::cpu_inner_product_fwd_pd_t;
 
-        DECLARE_COMMON_PD_T("RISCV64GCV:gemm", rvv_gemm_inner_product_fwd_t);
+        DECLARE_COMMON_PD_T("gemm:rvv", rvv_gemm_inner_product_fwd_t);
 
         status_t init(engine_t *engine) {
             UNUSED(engine);

@@ -45,13 +45,6 @@
 #define CPU_INSTANCE_AARCH64_ACL(...) \
     DNNL_AARCH64_ACL_ONLY(CPU_INSTANCE(__VA_ARGS__))
 #define CPU_INSTANCE_RV64(...) DNNL_RV64_ONLY(CPU_INSTANCE(__VA_ARGS__))
-// TODO: CPU_INSTANCE_RV64GCV[_ZVFH] gate registration on the build-time
-// RVV/Zvfh intrinsics flags (legacy build-time ISA identification). Once the
-// remaining intrinsic-based RV64 primitives are migrated to JIT and onto
-// CPU_INSTANCE_RV64 (runtime mayiuse dispatch), remove these two macros.
-#define CPU_INSTANCE_RV64GCV(...) DNNL_RV64GCV_ONLY(CPU_INSTANCE(__VA_ARGS__))
-#define CPU_INSTANCE_RV64GCV_ZVFH(...) \
-    DNNL_RV64GCV_ZVFH_ONLY(CPU_INSTANCE(__VA_ARGS__))
 #define CPU_INSTANCE_PPC64(...) DNNL_PPC64_ONLY(CPU_INSTANCE(__VA_ARGS__))
 
 #if DNNL_EXPERIMENTAL_GROUPED_MEMORY

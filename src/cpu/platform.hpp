@@ -86,25 +86,6 @@
 #define DNNL_AARCH64_ONLY(...) Z_CONDITIONAL_DO(DNNL_AARCH64, __VA_ARGS__)
 #define DNNL_RV64_ONLY(...) Z_CONDITIONAL_DO(DNNL_RV64, __VA_ARGS__)
 
-// Using RISC-V implementations optimized with RVV Intrinsics is optional for RISC-V builds
-// and can be enabled with DNNL_ARCH_OPT_FLAGS="-march=<ISA-string>" option, where <ISA-string>
-// contains V extension. If disabled, generic reference implementations will be used.
-// TODO: DNNL_RV64GCV_ONLY / DNNL_RV64GCV_ZVFH_ONLY back the legacy build-time
-// ISA macros CPU_INSTANCE_RV64GCV[_ZVFH]. Remove both once all RV64 primitives
-// are JIT and registered via DNNL_RV64_ONLY (runtime mayiuse dispatch).
-#if defined(DNNL_RV64) && defined(DNNL_RISCV_USE_RVV_INTRINSICS)
-#define DNNL_RV64GCV_ONLY(...) __VA_ARGS__
-#else
-#define DNNL_RV64GCV_ONLY(...)
-#endif
-
-// Zvfh intrinsics are enabled if V extension is enabled and Zvfh is supported by the toolchain.
-#if defined(DNNL_RV64) && defined(DNNL_RISCV_USE_ZVFH_INTRINSICS)
-#define DNNL_RV64GCV_ZVFH_ONLY(...) __VA_ARGS__
-#else
-#define DNNL_RV64GCV_ZVFH_ONLY(...)
-#endif
-
 // Negation of the helper macros above
 #define DNNL_NON_X64_ONLY(...) Z_CONDITIONAL_DO(Z_NOT(DNNL_X64), __VA_ARGS__)
 

@@ -22,6 +22,7 @@
 
 #include "cpu/cpu_batch_normalization_pd.hpp"
 #include "cpu/platform.hpp"
+#include "cpu/rv64/cpu_isa_traits.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -33,13 +34,16 @@ struct rvv_batch_normalization_fwd_t : public primitive_t {
         using cpu_batch_normalization_fwd_pd_t::
                 cpu_batch_normalization_fwd_pd_t;
 
-        DECLARE_COMMON_PD_T_("RISCV64GCV", rvv_batch_normalization_fwd_t);
+        DECLARE_COMMON_PD_T_("jit:rvv", rvv_batch_normalization_fwd_t);
 
         status_t init(engine_t *engine) {
             UNUSED(engine);
 
             using namespace data_type;
 
+            // Vector kernels are JIT-emitted; the rv64gc baseline build means a
+            // non-V CPU must defer to the next (reference) implementation.
+            VDISPATCH_BNORM(mayiuse(v), VERBOSE_UNSUPPORTED_ISA);
             VDISPATCH_BNORM(is_fwd(), VERBOSE_BAD_PROPKIND);
 
             const data_type_t dtsrc = src_md()->data_type;
