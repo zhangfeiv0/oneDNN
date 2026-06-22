@@ -14,7 +14,7 @@
  * limitations under the License.
  ******************************************************************************/
 
-#include <riscv_vector.h>
+#include <cmath>
 
 #include "cpu/rv64/jit_rvv_inner_product_kernel.hpp"
 #include "cpu/rv64/rvv_inner_product.hpp"
@@ -48,26 +48,6 @@ dim_t get_ip_weights_off(const memory_desc_wrapper &mdw, int ndims, dim_t oc,
     }
 }
 
-float compute_ip_rvv_fwd_f32_f32(
-        const void *src, const void *weights, const dim_t len) {
-    const float *x = reinterpret_cast<const float *>(src);
-    const float *w = reinterpret_cast<const float *>(weights);
-
-    float acc_scalar = 0.0f;
-    for (dim_t i = 0; i < len;) {
-        size_t vl = __riscv_vsetvl_e32m1(static_cast<size_t>(len - i));
-        vfloat32m1_t vx = __riscv_vle32_v_f32m1(x + i, vl);
-        vfloat32m1_t vw = __riscv_vle32_v_f32m1(w + i, vl);
-        vfloat32m1_t vprod = __riscv_vfmul_vv_f32m1(vx, vw, vl);
-        vfloat32m1_t vzero = __riscv_vfmv_v_f_f32m1(0.0f, vl);
-        vfloat32m1_t vred = __riscv_vfredusum_vs_f32m1_f32m1(vprod, vzero, vl);
-        float partial = __riscv_vfmv_f_s_f32m1_f32(vred);
-        acc_scalar += partial;
-        i += static_cast<dim_t>(vl);
-    }
-    return acc_scalar;
-}
-
 float compute_ip_rvv_fwd_s8_s8(
         const void *src, const void *weights, const dim_t len) {
     return jit_rvv_inner_product_fwd_s8_s8(src, weights, len);
@@ -82,11 +62,6 @@ float compute_ip_rvv_fwd(const void *src_base, const void *wei_base,
         const dim_t len, const data_type_t src_dt, const data_type_t wei_dt) {
     float acc = 0.0f;
     switch (src_dt) {
-        case data_type::f32:
-            if (wei_dt == data_type::f32) {
-                acc = compute_ip_rvv_fwd_f32_f32(src_base, wei_base, len);
-            }
-            break;
         case data_type::s8:
             if (wei_dt == data_type::s8) {
                 acc = compute_ip_rvv_fwd_s8_s8(src_base, wei_base, len);

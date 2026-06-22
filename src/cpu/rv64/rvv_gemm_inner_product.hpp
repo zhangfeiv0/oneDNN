@@ -27,6 +27,8 @@
 #include "cpu/cpu_inner_product_pd.hpp"
 #include "cpu/platform.hpp"
 
+#include "cpu/rv64/cpu_isa_traits.hpp"
+
 namespace dnnl {
 namespace impl {
 namespace cpu {
@@ -47,6 +49,10 @@ struct rvv_gemm_inner_product_fwd_t : public primitive_t {
             const auto wei_type = weights_md(0)->data_type;
             const auto dst_type = dst_md(0)->data_type;
             const auto bia_type = weights_md(1)->data_type;
+
+            // V is not part of the RV64 baseline; the JIT GEMM kernel emits
+            // vector instructions, so gate on runtime ISA detection.
+            VDISPATCH_INNER_PRODUCT(mayiuse(v), VERBOSE_UNSUPPORTED_ISA);
 
             VDISPATCH_INNER_PRODUCT(is_fwd(), VERBOSE_BAD_PROPKIND);
             VDISPATCH_INNER_PRODUCT(
