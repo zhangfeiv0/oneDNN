@@ -104,22 +104,15 @@ jobs:
   test:
     needs: build
     strategy:
+      fail-fast: false
       matrix:
-        config: [
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 1, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 2, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 3, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 4, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 5, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 6, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 7, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 8, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 9, stride: 10 },
-          { name: riscv-test-vlen128, threading: OMP, testset: CI, vlen: 128, build: RelWithAssert, part: 10, stride: 10 }
-        ]
+        vlen: [128, 256]
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-    name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}, part-${{ matrix.config.part }}
+    name: riscv-test-vlen${{ matrix.vlen }}, OMP, part-${{ matrix.part }}
     runs-on: ubuntu-24.04
+    env:
+      QEMU_CPU: "rv64,v=true,vlen=${{ matrix.vlen }},vext_spec=v1.0,zvfh=true,zvfbfmin=true,zvfbfwma=true"
     steps:
       - name: Checkout oneDNN
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -133,11 +126,15 @@ jobs:
           content="${content//[$'\t\r\n$ ']}"
           echo "output=$content" >> $GITHUB_OUTPUT
 
-      # Setup QEMU for RISC-V platform support
+      # Setup QEMU for RISC-V platform support. Pin a recent binfmt image so QEMU
+      # is new enough to model the V, Zvfh and BF16 (Zvfbfmin/Zvfbfwma) extensions;
+      # the version is printed by the "Verify QEMU" step below so the image can be
+      # pinned to a digest later.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
         with:
           platforms: riscv64
+          image: tonistiigi/binfmt:latest
 
       # Install cross-compilation tools
       - name: Install cross-compilation tools
@@ -157,17 +154,20 @@ jobs:
         run: |
           tar -xzf build.tar.gz
 
+      - name: Verify QEMU supports RVV extensions (zvfh/bf16)
+        working-directory: ${{ github.workspace }}/oneDNN/build
+        run: bash ${{ github.workspace }}/oneDNN/.github/automation/riscv/qemu-check.sh
+
       - name: Run oneDNN tests
         run: ${{ github.workspace }}/oneDNN/.github/automation/riscv/test.sh
         working-directory: ${{ github.workspace }}/oneDNN/build
         env:
           CTEST_PARALLEL_LEVEL: 4
           ONEDNN_TEST_PARTITION: balanced
-          ONEDNN_THREADING: ${{ matrix.config.threading }}
-          ONEDNN_TEST_SET: ${{ matrix.config.testset }}
-          ONEDNN_TEST_PART: ${{ matrix.config.part }}
-          ONEDNN_TEST_STRIDE: ${{ matrix.config.stride }}
-          QEMU_CPU: "rv64,v=true,vlen=${{ matrix.config.vlen }},vext_spec=v1.0"
+          ONEDNN_THREADING: OMP
+          ONEDNN_TEST_SET: CI
+          ONEDNN_TEST_PART: ${{ matrix.part }}
+          ONEDNN_TEST_STRIDE: 10
 
   # This job adds a check named "Weekly RISC-V" that represents overall
   # workflow status and can be used in branch rulesets

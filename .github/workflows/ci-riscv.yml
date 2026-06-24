@@ -22,7 +22,7 @@ name: "CI RISC-V"
 #* https://github.com/orgs/community/discussions/26940#discussioncomment-5686753
 on:
   push:
-    branches: [main, "rls-*"]
+    branches: [main, dev-ci, "rls-*"]
     paths:
       - ".github/automation/riscv/**"
       - ".github/workflows/ci-riscv.yml"
@@ -60,11 +60,37 @@ concurrency:
 permissions: read-all
 
 jobs:
+  # Decide the test scope from the change set: a PR (or push) that touches
+  # src/cpu/rv64/** runs the full CI test set (balanced split, VLEN 128 + 256);
+  # anything else runs SMOKE so it does not slow non-RISC-V reviews. Manual or
+  # edge runs default to CI. Drives the build testset and the test matrix below.
+  scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      scope: ${{ steps.decide.outputs.scope }}
+      testset: ${{ steps.decide.outputs.testset }}
+      matrix: ${{ steps.decide.outputs.matrix }}
+    steps:
+      - name: Checkout oneDNN
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Decide test scope
+        id: decide
+        run: bash .github/automation/riscv/ci-scope.sh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+
   build:
+    needs: scope
     strategy:
       matrix:
         config: [
-          { name: riscv-build, label: ubuntu-24.04, threading: OMP, toolset: gcc, build: RelWithAssert, testset: SMOKE }
+          { name: riscv-build, label: ubuntu-24.04, threading: OMP, toolset: gcc, build: RelWithAssert }
         ]
 
     name: ${{ matrix.config.name }}, ${{ matrix.config.toolset }}, ${{ matrix.config.threading }}, ${{ matrix.config.build }}
@@ -105,7 +131,7 @@ jobs:
           CMAKE_GENERATOR: Ninja
           GCC_VERSION: ${{ fromJson(steps.get-versions.outputs.output).dependencies.gcc }}
           ONEDNN_ACTION: configure
-          ONEDNN_TEST_SET: ${{ matrix.config.testset }}
+          ONEDNN_TEST_SET: ${{ needs.scope.outputs.testset }}
           ONEDNN_THREADING: ${{ matrix.config.threading }}
 
       - name: Build oneDNN
@@ -129,17 +155,16 @@ jobs:
           retention-days: 1
 
   test:
-    needs: build
+    needs: [scope, build]
     strategy:
-      matrix:
-        config: [
-          # Test with different vector lengths and threading modes
-          { name: riscv-test-vlen128, threading: OMP, testset: SMOKE, vlen: 128, build: RelWithAssert },
-          { name: riscv-test-vlen256, threading: OMP, testset: SMOKE, vlen: 256, build: RelWithAssert }
-        ]
+      fail-fast: false
+      # SMOKE -> {"vlen":[128,256]} (2 jobs); CI -> vlen x part (20 jobs, balanced).
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
 
-    name: ${{ matrix.config.name }}, ${{ matrix.config.threading }}
+    name: riscv-test-vlen${{ matrix.vlen }}${{ matrix.part && format(', part-{0}', matrix.part) || '' }}
     runs-on: ubuntu-24.04
+    env:
+      QEMU_CPU: "rv64,v=true,vlen=${{ matrix.vlen }},vext_spec=v1.0,zvfh=true,zvfbfmin=true,zvfbfwma=true"
     steps:
       - name: Checkout oneDNN
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -154,11 +179,15 @@ jobs:
           content="${content//[$'\t\r\n$ ']}"
           echo "output=$content" >> $GITHUB_OUTPUT
 
-      # Setup QEMU for RISC-V platform support
+      # Setup QEMU for RISC-V platform support. Pin a recent binfmt image so QEMU
+      # is new enough to model the V, Zvfh and BF16 (Zvfbfmin/Zvfbfwma) extensions;
+      # the version is printed by the "Verify QEMU" step below so the image can be
+      # pinned to a digest later.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
         with:
           platforms: riscv64
+          image: tonistiigi/binfmt:latest
 
       # Install cross-compilation tools
       - name: Install cross-compilation tools
@@ -178,14 +207,20 @@ jobs:
         run: |
           tar -xzf build.tar.gz
 
+      - name: Verify QEMU supports RVV extensions (zvfh/bf16)
+        working-directory: ${{ github.workspace }}/oneDNN/build
+        run: bash ${{ github.workspace }}/oneDNN/.github/automation/riscv/qemu-check.sh
+
       - name: Run oneDNN tests
         run: ${{ github.workspace }}/oneDNN/.github/automation/riscv/test.sh
         working-directory: ${{ github.workspace }}/oneDNN/build
         env:
           CTEST_PARALLEL_LEVEL: 4
-          ONEDNN_THREADING: ${{ matrix.config.threading }}
-          ONEDNN_TEST_SET: ${{ matrix.config.testset }}
-          QEMU_CPU: "rv64,v=true,vlen=${{ matrix.config.vlen }},vext_spec=v1.0"
+          ONEDNN_TEST_PARTITION: balanced
+          ONEDNN_THREADING: OMP
+          ONEDNN_TEST_SET: ${{ needs.scope.outputs.testset }}
+          ONEDNN_TEST_PART: ${{ matrix.part }}
+          ONEDNN_TEST_STRIDE: 10
 
   # This job adds a check named "CI RISC-V" that represents overall
   # workflow status and can be used in branch rulesets
