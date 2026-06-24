@@ -19,10 +19,6 @@ file(GLOB_RECURSE SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/*.[ch]pp
 )
 
-# The RV64 backend is pure JIT (Xbyak_riscv emits vector code at runtime), so
-# every source compiles for the rv64gc baseline regardless of the V extension.
-# There is no longer an intrinsic-only subset to exclude.
-
 # Build sources into an object library
 set(OBJ_LIB ${DNNL_LIBRARY_NAME}_cpu_riscv)
 add_library(${OBJ_LIB} OBJECT ${SOURCES})
