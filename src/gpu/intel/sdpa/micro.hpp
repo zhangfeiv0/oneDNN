@@ -321,8 +321,6 @@ struct micro_fwd_t : public primitive_t {
                         vgs, static_cast<long int>(desc()->val_md()->dims[3]));
             }
 
-            CHECK(init_conf_microkernels(engine));
-            CHECK(init_conf(engine));
             VDISPATCH_SDPA(IMPLICATION((arch() == compute::gpu_arch_t::xe_hpc)
                                            && (desc()->qry_md()->data_type
                                                    == data_type::f32),
@@ -334,6 +332,9 @@ struct micro_fwd_t : public primitive_t {
                             attr()->dropout_.use_host_scalars_),
                     "fused SDPA FWD with device dropout not supported "
                     "for xe_hpg");
+
+            CHECK(init_conf_microkernels(engine));
+            CHECK(init_conf(engine));
 
             return status::success;
         }
