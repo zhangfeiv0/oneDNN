@@ -25,6 +25,7 @@
 #include "cpu/x64/jit_uni_eltwise_int.hpp"
 using namespace dnnl::impl::cpu::x64;
 #elif DNNL_AARCH64
+#include "cpu/aarch64/eltwise_lut.hpp"
 #include "cpu/aarch64/jit_uni_eltwise.hpp"
 #include "cpu/aarch64/jit_uni_eltwise_int.hpp"
 #if defined(DNNL_AARCH64_USE_ACL)
@@ -60,6 +61,7 @@ const std::map<pk_impl_key_t, std::vector<impl_list_item_t>> &impl_list_map() {
             CPU_INSTANCE_X64(jit_uni_eltwise_int_fwd_t<avx512_core>)
             CPU_INSTANCE_X64(jit_uni_eltwise_int_fwd_t<avx2>)
             CPU_INSTANCE_X64(jit_uni_eltwise_int_fwd_t<sse41>)
+            CPU_INSTANCE_AARCH64(eltwise_lut_fwd_t)
             CPU_INSTANCE_AARCH64(jit_uni_eltwise_fwd_t<sve>)
             CPU_INSTANCE_AARCH64(jit_uni_eltwise_fwd_t<asimd>)
             CPU_INSTANCE_AARCH64(jit_uni_eltwise_int_fwd_t<sve_512, s32>)
