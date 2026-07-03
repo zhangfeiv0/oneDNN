@@ -18,6 +18,7 @@
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/memory.hpp"
+#include "common/type_helpers.hpp"
 #include "common/utils.hpp"
 
 #include "cpu/rv64/jit_rvv_1x1_conv_kernel.hpp"
@@ -52,7 +53,15 @@ status_t jit_rvv_1x1_conv_kernel_t::init_conf(jit_1x1_conv_conf_t &jcp,
     jcp.prop_kind = cd.prop_kind;
     jcp.nthr = nthreads;
 
+    // src/weights dtype. f32 multiplies in place; a symmetric bf16/f16 src+wei
+    // uses widening FMA (Zvfbfwma/Zvfh) into f32 accumulators. For weight
+    // compression (f32 src, bf16/f16 wei) the weights are widened to f32 and a
+    // plain f32 FMA is used; only the weight element size differs from f32.
+    jcp.src_dt = src_d.data_type();
+    jcp.wei_dt = weights_d.data_type();
+
     jcp.with_bias = cd.bias_desc.format_kind != format_kind::undef;
+    jcp.bia_dt = jcp.with_bias ? cd.bias_desc.data_type : data_type::undef;
 
     // Initialize dimensions
     jcp.mb = src_d.dims()[0];
@@ -67,9 +76,15 @@ status_t jit_rvv_1x1_conv_kernel_t::init_conf(jit_1x1_conv_conf_t &jcp,
     const int vlen = nstl::min(1024u, get_platform_vlen());
     jcp.simd_w = vlen / (sizeof(float) * 8);
 
+    // bf16/f16 accumulate at e32/m2 (2 registers), so one widening FMA spans
+    // 2x simd_w OC lanes; f32 uses e32/m1 (simd_w lanes).
+    const bool is_lowp
+            = utils::one_of(jcp.src_dt, data_type::bf16, data_type::f16);
+    const int oc_block = is_lowp ? 2 * jcp.simd_w : jcp.simd_w;
+
     // OC is padded to match oc_block in weights format (OihwXo)
     // IC is not padded; kernel handles IC tail processing
-    jcp.oc = rnd_up(jcp.oc, jcp.simd_w);
+    jcp.oc = rnd_up(jcp.oc, oc_block);
 
     // 3D convolution support
     jcp.id = (ndims == 5) ? src_d.dims()[2] : 1;
@@ -84,7 +99,7 @@ status_t jit_rvv_1x1_conv_kernel_t::init_conf(jit_1x1_conv_conf_t &jcp,
     jcp.os = jcp.od * jcp.oh * jcp.ow;
     jcp.is = jcp.id * jcp.ih * jcp.iw;
 
-    jcp.oc_block = jcp.simd_w;
+    jcp.oc_block = oc_block;
     jcp.ic_block = jcp.simd_w;
 
     // Dynamic parameter calculation
@@ -151,10 +166,15 @@ status_t jit_rvv_1x1_conv_kernel_t::init_conf(jit_1x1_conv_conf_t &jcp,
         }
     }
 
-    // Adjust ur based on load_loop_blk (ensure register limit)
-    // Register constraint: ur * load_loop_blk + unroll * load_loop_blk + 1 <= 32
-    int max_ur_for_blk = (32 - 1 - jcp.reduce_loop_unroll * jcp.load_loop_blk)
-            / jcp.load_loop_blk;
+    // Adjust ur based on load_loop_blk (ensure register limit).
+    // f32:      1 (v0) + ur*blk accums (m1) + unroll*blk weights (m1) <= 32.
+    // bf16/f16: 2 (v0,v1 pad) + 2*ur*blk accums (m2) + 2 bias temp (m2)
+    //           + unroll*blk weights (m1) <= 32.
+    const int regs_per_accum = is_lowp ? 2 : 1;
+    const int reg_avail = is_lowp ? (32 - 2 - 2) : (32 - 1);
+    int max_ur_for_blk
+            = (reg_avail - jcp.reduce_loop_unroll * jcp.load_loop_blk)
+            / (regs_per_accum * jcp.load_loop_blk);
     if (jcp.ur > max_ur_for_blk) {
         jcp.ur = max_ur_for_blk;
         if (jcp.ur < 1) jcp.ur = 1;
@@ -194,12 +214,20 @@ status_t jit_rvv_1x1_conv_kernel_t::init_conf(jit_1x1_conv_conf_t &jcp,
         jcp.reduce_loop_unroll = 4;
     }
 
-    // Layout-dependent stride parameters (for NHWC)
-    jcp.typesize_in = sizeof(float);
+    // Layout-dependent stride parameters (for NHWC). Inputs (src/weights) may
+    // be 2-byte (bf16/f16); the destination accumulates/stores in f32.
+    jcp.typesize_in = static_cast<int>(types::data_type_size(jcp.src_dt));
+    // Weight element size. Equals typesize_in for f32/f32 and symmetric
+    // bf16/f16; for weight compression the weights are 2 bytes while src is 4.
+    jcp.typesize_wei = static_cast<int>(types::data_type_size(jcp.wei_dt));
     jcp.typesize_out = sizeof(float);
+    // bias element size (f32, or 2 bytes for a bf16/f16 bias widened to f32).
+    jcp.typesize_bia = jcp.with_bias
+            ? static_cast<int>(types::data_type_size(jcp.bia_dt))
+            : 0;
 
     jcp.reduce_loop_bcast_step = jcp.typesize_in;
-    jcp.reduce_loop_load_step = jcp.oc_block * jcp.typesize_in;
+    jcp.reduce_loop_load_step = jcp.oc_block * jcp.typesize_wei;
 
     // Strides within bcast_loop (spatial dimensions)
     jcp.bcast_loop_bcast_step
@@ -209,7 +237,7 @@ status_t jit_rvv_1x1_conv_kernel_t::init_conf(jit_1x1_conv_conf_t &jcp,
 
     // Strides within load_loop (OC dimension)
     jcp.load_loop_load_step
-            = jcp.ic_without_padding * jcp.oc_block * jcp.typesize_in;
+            = jcp.ic_without_padding * jcp.oc_block * jcp.typesize_wei;
     jcp.load_loop_iter_step = jcp.oc_block;
 
     return status::success;
@@ -228,10 +256,13 @@ void jit_rvv_1x1_conv_kernel_t::balance(jit_1x1_conv_conf_t &jcp) {
 void jit_rvv_1x1_conv_kernel_t::generate() {
     preamble();
 
-    // Set initial VL to oc_block (4)
+    // Accumulator view: e32/m2 for bf16/f16 (2 regs per accum), e32/m1 for f32.
+    const auto acc_lmul
+            = is_lowp() ? Xbyak_riscv::LMUL::m2 : Xbyak_riscv::LMUL::m1;
+
+    // Set initial VL to oc_block
     li(reg_tmp_imm, jcp.oc_block);
-    vsetvli(reg_tmp_imm, reg_tmp_imm, Xbyak_riscv::SEW::e32,
-            Xbyak_riscv::LMUL::m1);
+    vsetvli(reg_tmp_imm, reg_tmp_imm, SEW::e32, acc_lmul, VTA::ta, VMA::ma);
 
     // Load parameters
     ld(reg_bcast_data, reg_param, GET_OFF(bcast_data));
@@ -253,7 +284,7 @@ void jit_rvv_1x1_conv_kernel_t::generate() {
         add(reg_load_data, reg_load_data, reg_tmp_imm);
 
         if (jcp.with_bias) {
-            li(reg_tmp_imm, load_loop_blk * jcp.oc_block * jcp.typesize_out);
+            li(reg_tmp_imm, load_loop_blk * jcp.oc_block * jcp.typesize_bia);
             add(reg_bias_data, reg_bias_data, reg_tmp_imm);
         }
 
@@ -273,8 +304,8 @@ void jit_rvv_1x1_conv_kernel_t::generate() {
 
         // Ensure VL is full
         li(reg_tmp_imm, jcp.oc_block);
-        vsetvli(reg_tmp_imm, reg_tmp_imm, Xbyak_riscv::SEW::e32,
-                Xbyak_riscv::LMUL::m1);
+        vsetvli(reg_tmp_imm, reg_tmp_imm, SEW::e32, acc_lmul, VTA::ta, VMA::ma);
+        mv(reg_blk_vl, reg_tmp_imm); // save VL for bf16/f16 SEW switches
 
         load_loop_body(jcp.load_loop_blk);
         jal(x0, load_loop_label);
@@ -287,8 +318,9 @@ void jit_rvv_1x1_conv_kernel_t::generate() {
         blez(reg_load_loop_work, load_loop_end);
 
         // Last block may be partial, use vsetvli to set VL dynamically
-        vsetvli(reg_tmp_imm, reg_load_loop_work, Xbyak_riscv::SEW::e32,
-                Xbyak_riscv::LMUL::m1);
+        vsetvli(reg_tmp_imm, reg_load_loop_work, SEW::e32, acc_lmul, VTA::ta,
+                VMA::ma);
+        mv(reg_blk_vl, reg_tmp_imm); // save VL for bf16/f16 SEW switches
 
         bcast_loop(1);
 
@@ -296,7 +328,7 @@ void jit_rvv_1x1_conv_kernel_t::generate() {
         li(reg_tmp_imm, jcp.load_loop_load_step);
         add(reg_load_data, reg_load_data, reg_tmp_imm);
         if (jcp.with_bias) {
-            li(reg_tmp_imm, jcp.oc_block * jcp.typesize_out);
+            li(reg_tmp_imm, jcp.oc_block * jcp.typesize_bia);
             add(reg_bias_data, reg_bias_data, reg_tmp_imm);
         }
         li(reg_tmp_imm, jcp.oc_block * jcp.typesize_out);
@@ -375,6 +407,80 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
     mv(aux_reg_load_data, reg_load_data);
     mv(aux_reg_bcast_data, aux1_reg_bcast_data);
 
+    // bf16/f16: load src (broadcast) and weights as 16-bit and accumulate via
+    // widening FMA into the f32 accumulators. The accumulator init/store and
+    // bias run at e32/m2; the weight-load + FMA region runs at e16/m1 (same VL,
+    // since VLMAX(e16,m1) == VLMAX(e32,m2) == oc_block). f32 stays e32/m1 and
+    // is unchanged.
+    const bool is_lowp
+            = utils::one_of(jcp.src_dt, data_type::bf16, data_type::f16);
+    const bool is_bf16 = jcp.src_dt == data_type::bf16;
+    // Weight compression: f32 src with 16-bit weights. The weights are widened
+    // to f32 and a plain f32 FMA runs on the e32/m1 accumulator view, so this
+    // is distinct from the symmetric is_lowp (e32/m2, widening-FMA) path.
+    const bool wei16
+            = utils::one_of(jcp.wei_dt, data_type::bf16, data_type::f16);
+    const bool wei_decomp = !is_lowp && wei16;
+    const bool is_wei_bf16 = jcp.wei_dt == data_type::bf16;
+    // A bf16/f16 bias (== src) is loaded 16-bit and widened to f32 (only
+    // happens on the is_lowp / e32-m2 path; an f32 bias stays vle32).
+    const bool bia16 = jcp.with_bias
+            && utils::one_of(jcp.bia_dt, data_type::bf16, data_type::f16);
+
+    auto emit_wload = [=](const VReg &vr, const Reg &addr) {
+        if (wei_decomp) {
+            // 16-bit weights: load into the scratch and widen to f32. Runs
+            // under the e16/mf2 view set by wsew_load(); the widened result is
+            // e32/m1 (oc_block lanes), ready for the f32 FMA.
+            vle16_v(vreg_wtmp(), addr);
+            if (is_wei_bf16)
+                vfwcvtbf16_f_f_v(vr, vreg_wtmp());
+            else
+                vfwcvt_f_f_v(vr, vreg_wtmp());
+        } else if (is_lowp) {
+            vle16_v(vr, addr);
+        } else {
+            vle32_v(vr, addr);
+        }
+    };
+    // Weight compression toggles the SEW view around a batch of weight loads:
+    // e16/mf2 for the vle16 + widening convert, then back to e32/m1 for the
+    // f32 FMA (no-op for the f32 and symmetric bf16/f16 paths).
+    auto wsew_load = [=]() {
+        if (wei_decomp)
+            vsetvli(reg_tmp_imm, reg_blk_vl, SEW::e16, LMUL::mf2, VTA::ta,
+                    VMA::ma);
+    };
+    auto wsew_fma = [=]() {
+        if (wei_decomp)
+            vsetvli(reg_tmp_imm, reg_blk_vl, SEW::e32, LMUL::m1, VTA::ta,
+                    VMA::ma);
+    };
+    auto emit_bcast = [=](const FReg &fr, const Reg &addr, int off) {
+        if (is_lowp)
+            flh(fr, addr, off);
+        else
+            flw(fr, addr, off);
+    };
+    auto emit_fma = [=](const VReg &acc, const FReg &fr, const VReg &vr) {
+        if (is_bf16)
+            vfwmaccbf16_vf(acc, fr, vr);
+        else if (is_lowp)
+            vfwmacc_vf(acc, fr, vr);
+        else
+            vfmacc_vf(acc, fr, vr);
+    };
+    auto sew_compute = [=]() {
+        if (is_lowp)
+            vsetvli(reg_tmp_imm, reg_blk_vl, SEW::e16, LMUL::m1, VTA::ta,
+                    VMA::ma);
+    };
+    auto sew_accum = [=]() {
+        if (is_lowp)
+            vsetvli(reg_tmp_imm, reg_blk_vl, SEW::e32, LMUL::m2, VTA::ta,
+                    VMA::ma);
+    };
+
     auto init = [=]() {
         Label init_zero, init_done;
         andi(reg_tmp_imm, reg_reduce_pos_flag, FLAG_REDUCE_FIRST);
@@ -398,21 +504,40 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
         jal(x0, init_done);
 
         L(init_zero);
+        // Load bias[oc_block] into the f32 vreg_bias_tmp. f32 bias loads
+        // directly; a bf16/f16 bias is loaded 16-bit and widened to f32 (the
+        // accumulator view is e32/m2 here, so switch to e16/m1 for the convert
+        // and back). vreg_load(0) is a free scratch (weights not loaded yet).
+        auto load_bias = [&](const Reg &addr) {
+            if (bia16) {
+                vsetvli(reg_tmp_imm, reg_blk_vl, SEW::e16, LMUL::m1, VTA::ta,
+                        VMA::ma);
+                vle16_v(vreg_load(0), addr);
+                if (is_bf16)
+                    vfwcvtbf16_f_f_v(vreg_bias_tmp(), vreg_load(0));
+                else
+                    vfwcvt_f_f_v(vreg_bias_tmp(), vreg_load(0));
+                vsetvli(reg_tmp_imm, reg_blk_vl, SEW::e32, LMUL::m2, VTA::ta,
+                        VMA::ma);
+            } else {
+                vle32_v(vreg_bias_tmp(), addr);
+            }
+        };
         for (int i_load = 0; i_load < load_loop_blk; ++i_load) {
             if (jcp.with_bias) {
                 size_t bias_off
-                        = (size_t)i_load * jcp.oc_block * jcp.typesize_out;
+                        = (size_t)i_load * jcp.oc_block * jcp.typesize_bia;
                 if (bias_off == 0) {
-                    vle32_v(vreg_load(0), reg_bias_data);
+                    load_bias(reg_bias_data);
                 } else {
                     li(reg_tmp_addr, bias_off);
                     add(reg_tmp_addr, reg_tmp_addr, reg_bias_data);
-                    vle32_v(vreg_load(0), reg_tmp_addr);
+                    load_bias(reg_tmp_addr);
                 }
             }
             for (int i_ur = 0; i_ur < ur; ++i_ur) {
                 if (jcp.with_bias) {
-                    vmv_v_v(vreg_accum(i_load, i_ur), vreg_load(0));
+                    vmv_v_v(vreg_accum(i_load, i_ur), vreg_bias_tmp());
                 } else {
                     vxor_vv(vreg_accum(i_load, i_ur), vreg_accum(i_load, i_ur),
                             vreg_accum(i_load, i_ur));
@@ -441,11 +566,11 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
 
     auto fma_block = [=](int current_unroll, bool last_block) {
         for (int i_unroll = 0; i_unroll < current_unroll; ++i_unroll) {
-            flw(freg_bcast, aux_reg_bcast_data, 0);
+            emit_bcast(freg_bcast, aux_reg_bcast_data, 0);
 
             for (int i_ur = 0; i_ur < ur; ++i_ur) {
                 for (int i_load = 0; i_load < load_loop_blk; ++i_load) {
-                    vfmacc_vf(vreg_accum(i_load, i_ur), freg_bcast,
+                    emit_fma(vreg_accum(i_load, i_ur), freg_bcast,
                             vreg_load(i_load, i_unroll));
                 }
 
@@ -453,11 +578,11 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
                     size_t offset
                             = (size_t)(i_ur + 1) * jcp.bcast_loop_bcast_step;
                     if (offset <= 2047) {
-                        flw(freg_bcast, aux_reg_bcast_data, offset);
+                        emit_bcast(freg_bcast, aux_reg_bcast_data, (int)offset);
                     } else {
                         li(reg_tmp_addr, offset);
                         add(reg_tmp_addr, reg_tmp_addr, aux_reg_bcast_data);
-                        flw(freg_bcast, reg_tmp_addr, 0);
+                        emit_bcast(freg_bcast, reg_tmp_addr, 0);
                     }
                 }
             }
@@ -471,6 +596,7 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
 
         // Prefetch weights for next iteration
         if (!last_block) {
+            wsew_load();
             for (int i_unroll = 0; i_unroll < jcp.reduce_loop_unroll;
                     ++i_unroll) {
                 for (int i_load = 0; i_load < load_loop_blk; ++i_load) {
@@ -479,28 +605,35 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
                             + (size_t)i_load * jcp.load_loop_load_step;
                     li(reg_tmp_addr, weight_off);
                     add(reg_tmp_addr, aux_reg_load_data, reg_tmp_addr);
-                    vle32_v(vreg_load(i_load, i_unroll), reg_tmp_addr);
+                    emit_wload(vreg_load(i_load, i_unroll), reg_tmp_addr);
                 }
             }
+            wsew_fma();
         }
     };
 
     init();
 
+    // Accumulators are now seeded (e32); switch to the e16/mf2 source view for
+    // the bf16/f16 widening-FMA reduction (no-op for f32).
+    sew_compute();
+
     // Load first round of weights (IC=0..unroll-1)
+    wsew_load();
     for (int i_unroll = 0; i_unroll < jcp.reduce_loop_unroll; ++i_unroll) {
         for (int i_load = 0; i_load < load_loop_blk; ++i_load) {
             size_t weight_off = (size_t)i_unroll * jcp.reduce_loop_load_step
                     + (size_t)i_load * jcp.load_loop_load_step;
             if (weight_off == 0) {
-                vle32_v(vreg_load(i_load, i_unroll), aux_reg_load_data);
+                emit_wload(vreg_load(i_load, i_unroll), aux_reg_load_data);
             } else {
                 li(reg_tmp_addr, weight_off);
                 add(reg_tmp_addr, aux_reg_load_data, reg_tmp_addr);
-                vle32_v(vreg_load(i_load, i_unroll), reg_tmp_addr);
+                emit_wload(vreg_load(i_load, i_unroll), reg_tmp_addr);
             }
         }
     }
+    wsew_fma();
 
     mv(reduce_loop_iter, reg_reduce_loop_work);
     Label reduce_loop_label, reduce_loop_tail;
@@ -533,32 +666,34 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
         Label tail_loop;
         L(tail_loop);
         {
+            wsew_load();
             for (int i_load = 0; i_load < load_loop_blk; ++i_load) {
                 size_t weight_off = (size_t)i_load * jcp.load_loop_load_step;
                 if (weight_off == 0) {
-                    vle32_v(vreg_load(i_load, 0), aux_reg_load_data);
+                    emit_wload(vreg_load(i_load, 0), aux_reg_load_data);
                 } else {
                     li(reg_tmp_addr, weight_off);
                     add(reg_tmp_addr, aux_reg_load_data, reg_tmp_addr);
-                    vle32_v(vreg_load(i_load, 0), reg_tmp_addr);
+                    emit_wload(vreg_load(i_load, 0), reg_tmp_addr);
                 }
             }
+            wsew_fma();
 
-            flw(freg_bcast, aux_reg_bcast_data, 0);
+            emit_bcast(freg_bcast, aux_reg_bcast_data, 0);
             for (int i_ur = 0; i_ur < ur; ++i_ur) {
                 for (int i_load = 0; i_load < load_loop_blk; ++i_load) {
-                    vfmacc_vf(vreg_accum(i_load, i_ur), freg_bcast,
+                    emit_fma(vreg_accum(i_load, i_ur), freg_bcast,
                             vreg_load(i_load, 0));
                 }
                 if (i_ur + 1 < ur) {
                     size_t offset
                             = (size_t)(i_ur + 1) * jcp.bcast_loop_bcast_step;
                     if (offset <= 2047) {
-                        flw(freg_bcast, aux_reg_bcast_data, offset);
+                        emit_bcast(freg_bcast, aux_reg_bcast_data, (int)offset);
                     } else {
                         li(reg_tmp_addr, offset);
                         add(reg_tmp_addr, reg_tmp_addr, aux_reg_bcast_data);
-                        flw(freg_bcast, reg_tmp_addr, 0);
+                        emit_bcast(freg_bcast, reg_tmp_addr, 0);
                     }
                 }
             }
@@ -572,6 +707,9 @@ void jit_rvv_1x1_conv_kernel_t::reduce_loop(int load_loop_blk, int ur) {
         }
         L(tail_done);
     }
+
+    // Restore the e32/m1 accumulator view before storing the f32 results.
+    sew_accum();
 
     store();
 }

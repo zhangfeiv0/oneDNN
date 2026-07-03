@@ -19,6 +19,7 @@
 
 #include "common/c_types_map.hpp"
 #include "common/memory_tracking.hpp"
+#include "common/utils.hpp"
 
 #include "cpu/rv64/jit_generator.hpp"
 #include "cpu/rv64/jit_primitive_conf.hpp"
@@ -73,21 +74,44 @@ private:
     const Reg reduce_loop_iter = s0;
     const Reg reg_bcast_loop_iter = s1;
     const Reg reg_reduce_pos_flag = s2;
-    const Reg reg_output_stride = s3;
+    // Saved active vector length (in OC lanes) for the current load block, so
+    // the bf16/f16 path can switch SEW (e32<->e16) without changing VL.
+    const Reg reg_blk_vl = s3;
 
     const Reg reg_tmp_imm = s4;
     const Reg reg_tmp_addr = s5;
 
+    // bf16/f16 use e32/m2 accumulators (2 registers each, even-aligned) fed by
+    // e16/m1 weights, so one widening FMA covers 2x the OC lanes of the f32
+    // e32/m1 path. f32 keeps single-register (m1) accumulators from v1.
+    bool is_lowp() const {
+        return utils::one_of(jcp.src_dt, data_type::bf16, data_type::f16);
+    }
+    int acc_nregs() const { return is_lowp() ? 2 : 1; }
+    int acc_base() const { return is_lowp() ? 2 : 1; }
+
     VReg vreg_accum(int i_load, int i_ur) {
-        // Avoid v0, start from v1
-        return VReg(1 + i_ur * jcp.load_loop_blk + i_load);
+        return VReg(
+                acc_base() + acc_nregs() * (i_ur * jcp.load_loop_blk + i_load));
     }
 
+    // Bias staging register: for f32 this aliases vreg_load(0) (unchanged); for
+    // bf16/f16 it is a dedicated m2 (2-register) slot right after the accums.
+    VReg vreg_bias_tmp() {
+        return VReg(acc_base() + acc_nregs() * jcp.ur * jcp.load_loop_blk);
+    }
+
+    // Scratch for weight compression (f32 src, 16-bit wei): the 16-bit weights
+    // are loaded here as e16/mf2 and widened to the f32 weight register. v0 is
+    // otherwise unused in the f32 accumulator layout (acc_base is 1).
+    VReg vreg_wtmp() const { return VReg(0); }
+
     VReg vreg_load(int i_load, int i_unroll = 0) {
-        // Allocate after accum to avoid conflicts
-        // accum uses v1 to v(ur * load_loop_blk)
-        return VReg(1 + jcp.ur * jcp.load_loop_blk
-                + i_unroll * jcp.load_loop_blk + i_load);
+        const int after_acc
+                = acc_base() + acc_nregs() * jcp.ur * jcp.load_loop_blk;
+        // bf16/f16 reserve a 2-register bias temp between accums and weights.
+        const int base = is_lowp() ? after_acc + 2 : after_acc;
+        return VReg(base + i_unroll * jcp.load_loop_blk + i_load);
     }
 
     const FReg freg_bcast = fa0;
