@@ -28,49 +28,116 @@ namespace impl {
 namespace cpu {
 namespace rv64 {
 
-// Memory layout family handled by the pooling kernel. Both are plain (no
-// blocked tags): nspc vectorizes along C, ncsp vectorizes along OW.
-enum class jit_pool_tag_kind_t { undef, nspc, ncsp };
+inline int calculate_end_padding(int start_padding, int dst_size, int src_size,
+        int spatial_stride, int dilated_filter_size) {
+    return (dst_size - 1) * spatial_stride + dilated_filter_size
+            - (src_size + start_padding);
+}
 
-// Centralized pooling configuration, populated by
-// jit_uni_pool_kernel_t::init_conf and consumed by the driver and the kernel.
-// Mirrors the role of aarch64/x64 jit_pool_conf_t (kept lean: no c_block /
-// blocked-format / transpose fields, which the RVV path does not use).
+// Memory layout family handled by the pooling primitive.
+//   blocked - nChw{c_block}c (c_block = VLEN/32), the x64/aarch64-style baked
+//             kernel path (channels are the vector dim, c_block per register).
+//   nspc    - channels-last plain; also the baked kernel (c_off = C).
+//   ncsp    - plain nchw; the RETAINED rv64-native path (vectorize along OW/C,
+//             no plain<->blocked transpose since rv64 has no JIT transpose).
+enum class jit_pool_tag_kind_t { undef, nspc, ncsp, blocked };
+
+// Fused-binary src1 broadcast category relative to dst, uniform across the whole
+// post-op chain (enforced by the pd gate). Classified ONCE during init_conf and
+// stored in jpp.binary_bcast; the kernels and driver read it back instead of
+// re-deriving the category, so the injector rhs load form (scalar flw / per-oc
+// contiguous vle / full-dst strided vlse) and the shared rhs offset stay in sync.
+//   none    - eltwise-only chain or no post-ops (no binary rhs)
+//   scalar  - per-tensor src1 (one value broadcast to every lane)
+//   per_oc  - [1,C,1,..] dense, matching dst's channel dim
+//   full_dst - dst-shaped src1 (per-element)
+enum class pool_binary_bcast_t {
+    none = 0,
+    scalar = 1,
+    per_oc = 2,
+    full_dst = 3
+};
+
+// Centralized pooling configuration. For the blocked/nspc baked kernel this is
+// the x64/aarch64 jit_pool_conf_t superset (c_block, ur, ur_bc, training,
+// backward, workspace dtype, ...). The native path (nspc/ncsp forward inference,
+// which is faster on RV64 than the baked port) additionally uses the fields
+// grouped at the bottom (ur_w / fuse_* / with_relu); use_native selects it.
 struct jit_pool_conf_t {
     int ndims;
-    int mb, c;
+    int mb, c, c_without_padding;
     int id, ih, iw, od, oh, ow;
     int stride_d, stride_h, stride_w;
     int kd, kh, kw;
     int f_pad, t_pad, l_pad;
     alg_kind_t alg;
+    bool is_training;
     bool is_backward;
+    bool simple_alg; // backward: kd<=stride_d (single accumulation pass)
+    bool is_c_padded; // blocked tag with padded channels (c_without_padding<c)
+    data_type_t ind_dt; // workspace index dtype (u8 or s32), max training/bwd
     data_type_t src_dt;
     data_type_t dst_dt;
     int dt_size;
+    bool is_f16; // f16 data (f32 accumulation; requires zvfh)
+
+    // Blocked/nspc vectorization: one m1 register == c_block f32 lanes.
+    int c_block, c_tail, nb_c;
+    int ur; // output-width unroll baked into the kernel
+    int ur_bc, ur_bc_tail; // channel-block unroll (nspc) / 1 (blocked)
+
     jit_pool_tag_kind_t tag_kind;
+    // True: the retained native kernel (nspc/ncsp forward inference). False: the
+    // x64/aarch64-style baked kernel (blocked, and nspc/blocked training +
+    // backward).
+    bool use_native;
     cpu_isa_t isa;
-    bool with_postops;
-    bool with_relu; // f32 single-ReLU flag; feeds empty_window_value() only.
-            // The post-op chain is fused via fuse_eltwise/fuse_binary.
-    bool fuse_eltwise; // eltwise post-op chain fused in-kernel via the injector
-            // (f32 and f16 eltwise-only)
-    bool fuse_binary; // f32 binary post-op fused in-kernel (channel-vec path)
-    float relu_alpha;
+
     post_ops_t post_ops;
+    bool with_postops;
+    bool with_eltwise;
+    bool with_binary;
+    // Broadcast category of the fused binary chain (classified once by the pd
+    // gate; none when there is no binary). See pool_binary_bcast_t.
+    pool_binary_bcast_t binary_bcast;
     int nthr;
-    // Output-width unroll for the shape-baked interior kernel (number of OW
-    // positions whose accumulators share loaded inputs, ARM max_step style).
-    int ur_w;
+
+    // --- native ncsp path only (retained rv64 design) ---
+    bool with_relu; // f32 single-ReLU flag; feeds empty_window_value()
+    bool fuse_eltwise; // eltwise chain fused (ncsp native)
+    bool fuse_binary; // binary fused (ncsp native, channel-vec)
+    float relu_alpha;
+    int ur_w; // ncsp native interior OW-unroll
 };
 
-// Per-call arguments for the agnostic (runtime-shape) kernel. Unlike aarch64/x64
-// — which bake the pooling window into the generated code — this kernel is
-// shape-agnostic and receives the window bounds and strides here, so one routine
-// per instantiation serves ncsp, OW==1, the nspc boundary columns, and (for f16)
-// the whole nspc row. (The f32 nspc interior uses the shape-baked kernel with
-// jit_uni_pool_interior_args_t.)
+// Per-call arguments for the x64/aarch64-style baked kernel (blocked/nspc).
+// Mirrors aarch64 jit_uni_pooling_args_t: the pooling window is baked into the
+// generated code and the driver passes per-(n,oh[,od]) padding counts and the
+// channel-block slice. The last two fields carry the rv64 in-kernel binary
+// post-op rhs (host-prepared pointer array + dst logical origin for full-dst).
 struct jit_uni_pooling_args_t {
+    const void *src;
+    const void *dst;
+    const void *indices; // max training (store) / backward (load) workspace
+    const void *zero_ptr; // backward: diff_src zeroing base
+    size_t zero_id; // backward: # input planes to zero
+    size_t zero_ih; // backward: # input rows to zero
+    size_t kd_padding; // valid kernel planes (kd - front/back overflow)
+    size_t kh_padding; // valid kernel rows   (kh - top/bottom overflow)
+    size_t kh_padding_shift; // index base offset from t/f overflow
+    size_t kd_padding_shift; // index d-step adjustment
+    float ker_area_h; // avg_exclude divisor base (valid kh*kd area)
+    size_t ur_bc; // # channel blocks to process in this call
+    size_t b_c; // # channel blocks already processed
+    const void *post_ops_binary_rhs_arg_vec; // per-binary rhs pointer array
+    const void *dst_orig; // dst logical origin (raw base + off_l(0)); the
+            // full-dst binary offset is (dst - dst_orig)
+};
+
+// Per-call arguments for the RETAINED native ncsp kernel (renamed from the old
+// jit_uni_pooling_args_t). Shape-agnostic: the window bounds and strides are
+// passed here, so one routine serves ncsp, OW==1, and boundary columns.
+struct jit_uni_pool_ncsp_args_t {
     const void *src;
     void *dst;
     dim_t channels;
@@ -85,25 +152,42 @@ struct jit_uni_pooling_args_t {
     bool with_relu;
     dim_t src_vec_byte_stride; // byte stride between vector elements in src
     dim_t dst_vec_byte_stride; // byte stride between vector elements in dst
-    // Binary post-op rhs (src1) base for this call. For full-dst per-element it
-    // points at the element matching this position's channel 0; for per-oc /
-    // per-tensor it points at the channel-0 / scalar value. Unused otherwise.
+    // Binary post-op: the injector runs in indirect mode so one chain can carry
+    // any number of binaries (all sharing one broadcast). post_op_rhs is the base
+    // of the per-binary rhs (src1) ORIGIN pointer array (one f32 pointer per
+    // binary). post_op_off0 is the shared byte offset of the first active lane:
+    // 0 for scalar/per-oc, and the full-dst position's channel-0 element offset
+    // (* sizeof(f32)) otherwise; the kernel advances it per channel chunk.
     const void *post_op_rhs = nullptr;
+    dim_t post_op_off0 = 0;
     // f16 generic path row unrolling: process n_pos output positions in one
     // call (adjacent positions share the window, so only the base pointers
-    // advance). The f32 agnostic kernel ignores these fields and always handles
-    // a single output position; f32 nspc interior reuse is handled by
-    // jit_uni_pool_interior_args_t instead.
+    // advance). The f32 kernel ignores these and handles a single position.
     dim_t n_pos = 1;
     dim_t pos_src_byte_stride = 0;
     dim_t pos_dst_byte_stride = 0;
+    // Max forward-training only (f32): the argmax workspace for this output
+    // position (indices) and the running kernel-window index. pos_base = the
+    // flattened index of the first (clamped) window element
+    // (kd_base*KH*KW + kh_base*KW + kw_base); as the kernel sweeps the clamped
+    // window it increments by 1 per iw, then adds pos_ih_step (= KW - kw_count)
+    // after each row and pos_id_step (= KH*KW - kh_count*KW) after each plane to
+    // skip the clamped-off positions. The per-channel argmax is stored here.
+    void *indices = nullptr;
+    dim_t pos_base = 0;
+    dim_t pos_ih_step = 0;
+    dim_t pos_id_step = 0;
+    // Byte stride between channel elements in the argmax workspace: ind_dt_size
+    // for the contiguous nspc workspace, dst_spatial * ind_dt_size for the
+    // strided ncsp workspace. The per-channel store is unit when this equals
+    // ind_dt_size, otherwise strided (vsse).
+    dim_t ws_vec_byte_stride = 0;
 };
 
-// Per-call arguments for the shape-baked interior kernel. The unroll structure
-// (kw, stride_w, ur_w), the algorithm, init value, avg_include scale, and the
-// fused eltwise post-op chain are baked into the generated code. Element strides
-// are passed (not baked) so the kernel stays correct for tensors whose strides
-// exceed 32 bits; the kernel derives the per-block strides from w_stride.
+// Per-call arguments for the shape-baked interior kernel (nspc f32 forward
+// inference). The unroll structure (kw, stride_w, ur_w), algorithm, init value,
+// avg_include scale, and the fused eltwise chain are baked into the generated
+// code; element strides are passed so 64-bit strides stay correct.
 struct jit_uni_pool_interior_args_t {
     const void *src; // channel 0 of (id_start, ih_start, iw_block_start)
     void *dst; // channel 0 of the first output column in the block
@@ -115,6 +199,33 @@ struct jit_uni_pool_interior_args_t {
     dim_t inW_stride; // byte stride between H rows (= iw * C * dt_size)
     dim_t inD_stride; // byte stride between D planes (= ih * iw * C * dt_size)
     float scale_val; // 1 / window for avg_exclude (ignored otherwise)
+};
+
+// One covering-output contribution to a single input position in the native
+// gather backward. Backward pooling is a gather: for each input position the
+// driver enumerates the (few) output positions whose pooling window covers it
+// and fills one contribution per output; the kernel accumulates their diff_dst
+// channel rows into the input's diff_src channel row and stores it once (no
+// scatter read-modify-write, so parallelising over inputs has no data race).
+// index/scale carry the max/avg payload: max adds diff_dst only where the stored
+// argmax equals index; avg adds diff_dst * scale (scale = 1 / num_summands, so
+// include- and exclude-padding are uniform per contribution).
+struct jit_uni_pool_bwd_contrib_t {
+    const void *diff_dst; // channel 0 of the covering output
+    const void *ws; // channel 0 of the covering output workspace (max)
+    int32_t index; // full-kernel index of this input in the window (max)
+    float scale; // 1 / num_summands for this output (avg)
+};
+
+// Per-call arguments for the native gather backward kernel (one input position).
+struct jit_uni_pool_bwd_args_t {
+    void *diff_src; // channel 0 of this input position (store target)
+    const jit_uni_pool_bwd_contrib_t *contribs;
+    dim_t count; // number of covering outputs (0 -> diff_src row is zeroed)
+    dim_t channels;
+    dim_t src_vec_byte_stride; // diff_src channel stride (nspc: dt, ncsp: ID*IH*IW*dt)
+    dim_t dst_vec_byte_stride; // diff_dst channel stride (nspc: dt, ncsp: OD*OH*OW*dt)
+    dim_t ws_vec_byte_stride; // ws channel stride (max; ncsp: OD*OH*OW*ind_sz)
 };
 
 struct jit_1x1_conv_conf_t {

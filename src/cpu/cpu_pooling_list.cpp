@@ -91,6 +91,8 @@ const std::map<pk_impl_key_t, std::vector<impl_list_item_t>> &impl_list_map() {
             CPU_INSTANCE_X64(jit_uni_pooling_bwd_t<avx, f32>)
             CPU_INSTANCE_X64(jit_uni_pooling_bwd_t<sse41, f32>)
             CPU_INSTANCE_AARCH64(jit_uni_pooling_bwd_t<sve, f32>)
+            CPU_INSTANCE_RV64(jit_uni_pooling_bwd_t<v>)
+            CPU_INSTANCE_RV64(jit_uni_pooling_bwd_t<zvfh>)
             CPU_INSTANCE(nchw_pooling_bwd_t<bf16>)
             CPU_INSTANCE(nchw_pooling_bwd_t<f32>)
             CPU_INSTANCE(nchw_pooling_bwd_t<f16>)
