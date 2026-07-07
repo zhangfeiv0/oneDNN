@@ -61,7 +61,10 @@ void jit_uni_binary_injector_t<isa>::compute_body(const Vmm &dst) {
             h_->flw(f_rhs_, gpr_, 0);
         else {
             h_->add(gpr_, gpr_, off_);
-            h_->vle32_v(v_rhs_, gpr_);
+            if (strided_)
+                h_->vlse32_v(v_rhs_, gpr_, rhs_stride_);
+            else
+                h_->vle32_v(v_rhs_, gpr_);
         }
     } else if (scalar)
         h_->flw(f_rhs_, rhs_addr_, 0);

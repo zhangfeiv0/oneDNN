@@ -89,6 +89,23 @@ struct static_params_t {
         , off(off)
         , gpr(gpr)
         , indirect(true) {}
+    // Indirect + strided: like the indirect ctor but per-element lanes are
+    // rhs_stride bytes apart (vlse from base + off). Used when the rhs lanes are
+    // not contiguous in memory (e.g. a full-dst binary over a channels-strided
+    // ncsp destination) while still carrying any number of binaries via the
+    // per-binary pointer array.
+    static_params_t(const Xbyak_riscv::VReg &v_rhs,
+            const Xbyak_riscv::FReg &f_rhs, const Xbyak_riscv::Reg &rhs_ptrs,
+            const Xbyak_riscv::Reg &off, const Xbyak_riscv::Reg &gpr,
+            const Xbyak_riscv::Reg &rhs_stride)
+        : v_rhs(v_rhs)
+        , f_rhs(f_rhs)
+        , rhs_addr(rhs_ptrs)
+        , rhs_stride(rhs_stride)
+        , strided(true)
+        , off(off)
+        , gpr(gpr)
+        , indirect(true) {}
 
     Xbyak_riscv::VReg v_rhs; // scratch to load a per-element rhs vector
     Xbyak_riscv::FReg f_rhs; // scratch to load a scalar rhs value
