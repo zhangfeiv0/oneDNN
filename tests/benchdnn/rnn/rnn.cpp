@@ -14,16 +14,15 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include <float.h>
-#include <math.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
-#include <stdio.h>
-#include <stdlib.h>
 #include <type_traits>
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_isa_common.hpp"
 #include "utils/dnnl_query.hpp"
 #include "utils/parallel.hpp"
 
@@ -32,6 +31,11 @@
 
 #include "rnn/rnn.hpp"
 #include "rnn/rnn_aux.hpp"
+
+#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
+#include "oneapi/dnnl/dnnl_threadpool.hpp"
+#include "tests/test_thread_decl.hpp"
+#endif
 
 // Using hidden attr API for testing RNN
 dnnl_status_t dnnl_primitive_attr_set_rnn_tparams(dnnl_primitive_attr_t attr,
