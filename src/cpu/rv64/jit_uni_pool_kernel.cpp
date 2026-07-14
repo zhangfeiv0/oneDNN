@@ -181,7 +181,8 @@ bool jit_uni_pool_kernel_t<isa>::post_ops_ok(jit_pool_conf_t &jpp,
     pool_binary_bcast_t bcast = pool_binary_bcast_t::none;
     for (const auto &e : post_ops.entry_) {
         if (e.is_eltwise()) {
-            if (!eltwise_injector::is_alg_supported(e.eltwise.alg))
+            if (!eltwise_injector::is_alg_supported(e.eltwise.alg)
+                    && !eltwise_injector::needs_extra_aux(e.eltwise.alg))
                 return false;
             jpp.with_eltwise = true;
         } else if (e.is_binary()) {
@@ -767,11 +768,16 @@ void jit_uni_pool_kernel_t<isa>::apply_postops(int ur_w, int c_off) {
     }
 
     for (int jj = 0; jj < ur_w; jj++) {
+        const int acc = vreg(reg_ind(0, jj, ur_w)).getIdx();
         if (bcast == 3) {
             addr_off(t2, t5, jj * c_off); // element index of output column jj
             slli(t2, t2, 2); // * sizeof(f32)
         }
-        postops_injector_->compute_vector(vreg(reg_ind(0, jj, ur_w)).getIdx());
+        // dynamic-params: t2 is the (byte) rhs offset for this column, exactly
+        // what the legacy static path read from bsp.off.
+        binary_injector::rhs_arg_dynamic_params_t rd;
+        rd.vmm_idx_to_out_off[acc] = t2;
+        postops_injector_->compute_vector(acc, rd);
     }
 }
 
@@ -822,9 +828,12 @@ void jit_uni_pool_kernel_t<isa>::generate() {
     }
 
     if (jpp.with_postops) {
-        eltwise_injector::static_params_t esp(v_eltw0, v_eltw1, v_eltw2,
-                f_eltw0, f_eltw1, t4, /*is_fwd=*/true);
+        // v_tmp is dead after pooling accumulation and can serve as the fourth
+        // eltwise aux at the post-op inject point.
+        eltwise_injector::static_params_t esp(v_eltw0, v_eltw1, v_eltw2, v_tmp,
+                v_tmp, f_eltw0, f_eltw1, t4, /*is_fwd=*/true);
         binary_injector::static_params_t bsp(v_bin_rhs, f_bin, reg_rhs, t2, t3);
+        bsp.off_is_bytes = true; // t2 is the per-column byte offset
         postops_injector_
                 = utils::make_unique<injector::jit_uni_postops_injector_t<isa>>(
                         this, jpp.post_ops, esp,
@@ -1011,8 +1020,8 @@ status_t jit_uni_pool_ncsp_kernel_t<isa, d_type>::init_conf(
     // contains the binary is routed by the driver through the channel-vectorized
     // single-position path so the rhs broadcast is uniform; the injector loads
     // the rhs (f32) per channel chunk. post_ops_ok already gated the chain.
-    const bool inj_ok
-            = injector::jit_uni_postops_injector_t<isa>::post_ops_ok(po);
+    const bool inj_ok = injector::jit_uni_postops_injector_t<isa>::post_ops_ok(
+            po, /*n_vaux=*/4);
     bool po_has_binary = false;
     for (int i = 0; i < po.len(); i++)
         if (po.entry_[i].is_binary()) po_has_binary = true;
@@ -1246,11 +1255,13 @@ void jit_uni_pool_ncsp_kernel_t<isa, d_type>::generate_f32() {
 
     // Apply the fused post-op chain (any number of eltwise + any number of
     // binaries, in attribute order) via the in-kernel injector. Eltwise covers
-    // ReLU and the other supported algs; binary reads its rhs from s10
-    // (host-positioned, advanced per channel chunk below).
+    // ReLU and the other supported algs; binary loads each rhs base from the
+    // pointer array and applies the shared offset in s11.
     if (jpp_.fuse_eltwise || jpp_.fuse_binary) {
-        eltwise_injector::static_params_t esp(
-                VReg(12), VReg(16), VReg(20), fa3, fa4, t2, /*is_fwd=*/true);
+        // v24 is also the binary rhs scratch, but the entries execute serially,
+        // so it is free as the fourth eltwise aux during an eltwise entry.
+        eltwise_injector::static_params_t esp(VReg(12), VReg(16), VReg(20),
+                VReg(24), VReg(24), fa3, fa4, t2, /*is_fwd=*/true);
         // Indirect injector mode (any number of binaries): rhs origin array in
         // s10 (or a4 when max-training, since s10 is then the ws pointer), s11 =
         // shared byte offset, a3 = per-binary scratch. Binary rhs scratch v24/fa5
@@ -1263,11 +1274,15 @@ void jit_uni_pool_ncsp_kernel_t<isa, d_type>::generate_f32() {
                 VReg(24), fa5, reg_rhs, s11, a3);
         binary_injector::static_params_t bsp_strided(
                 VReg(24), fa5, reg_rhs, s11, a3, s9);
+        bsp_contig.off_is_bytes = bsp_strided.off_is_bytes = true;
         injector::jit_uni_postops_injector_t<isa> po_inj(this, jpp_.post_ops,
                 esp,
                 jpp_.fuse_binary ? (bin_strided ? &bsp_strided : &bsp_contig)
                                  : nullptr);
-        po_inj.compute_vector(v_acc.getIdx());
+        // dynamic-params: s11 is the per-chunk byte offset (off_is_bytes).
+        binary_injector::rhs_arg_dynamic_params_t rhs_dyn;
+        rhs_dyn.vmm_idx_to_out_off[v_acc.getIdx()] = s11;
+        po_inj.compute_vector(v_acc.getIdx(), rhs_dyn);
     }
     // Store result — use vse32_v for unit stride
     {
@@ -1459,8 +1474,9 @@ void jit_uni_pool_ncsp_kernel_t<isa, d_type>::generate_f16() {
     // GPR reused across window iterations, free at the inject point. The binary
     // rhs scratch is v28/fa5 (f32); v24 is reserved for the max widen buffer.
     post_ops_t no_po;
-    eltwise_injector::static_params_t esp(
-            VReg(12), VReg(16), VReg(20), fa3, fa4, t1, /*is_fwd=*/true);
+    // v28 is the binary rhs scratch and is temporally free for eltwise entries.
+    eltwise_injector::static_params_t esp(VReg(12), VReg(16), VReg(20),
+            VReg(28), VReg(28), fa3, fa4, t1, /*is_fwd=*/true);
     // Indirect mode (any number of binaries): rhs origin array in s10 (or a4 when
     // max-training, since s10 is then the ws pointer), s11 = shared byte offset,
     // a3 = per-binary scratch. full-dst uses a strided (vlse) f32 load keyed on
@@ -1471,11 +1487,17 @@ void jit_uni_pool_ncsp_kernel_t<isa, d_type>::generate_f16() {
             VReg(28), fa5, reg_rhs, s11, a3);
     binary_injector::static_params_t bsp_strided(
             VReg(28), fa5, reg_rhs, s11, a3, reg_stride);
+    bsp_contig.off_is_bytes = bsp_strided.off_is_bytes = true;
     injector::jit_uni_postops_injector_t<isa> po_inj(this,
             (jpp_.fuse_eltwise || jpp_.fuse_binary) ? jpp_.post_ops : no_po,
             esp,
             jpp_.fuse_binary ? (bin_strided ? &bsp_strided : &bsp_contig)
                              : nullptr);
+    // dynamic-params: s11 is the per-chunk byte offset (off_is_bytes). Both the
+    // avg (v_acc) and max (v24) post-op registers use the same offset.
+    binary_injector::rhs_arg_dynamic_params_t rhs_dyn;
+    rhs_dyn.vmm_idx_to_out_off[v_acc.getIdx()] = s11;
+    rhs_dyn.vmm_idx_to_out_off[24] = s11;
 
     Label pos_loop, pos_done;
     if (!jpp_.fuse_binary && !max_train) {
@@ -1588,7 +1610,7 @@ void jit_uni_pool_ncsp_kernel_t<isa, d_type>::generate_f16() {
         vsetvli(t0, s2, SEW::e32, LMUL::m2, VTA::ta, VMA::ma);
         vfmul_vf(v_acc, v_acc, ft1);
         if (jpp_.fuse_eltwise || jpp_.fuse_binary)
-            po_inj.compute_vector(v_acc.getIdx());
+            po_inj.compute_vector(v_acc.getIdx(), rhs_dyn);
         vsetvli(t0, s2, SEW::e16, LMUL::m1, VTA::ta, VMA::ma);
         vfncvt_f_f_w(v_tmp, v_acc);
     } else if (jpp_.fuse_eltwise || jpp_.fuse_binary) {
@@ -1604,7 +1626,7 @@ void jit_uni_pool_ncsp_kernel_t<isa, d_type>::generate_f16() {
         vsetvli(t0, s2, SEW::e16, LMUL::m1, VTA::ta, VMA::ma);
         vfwcvt_f_f_v(VReg(24), v_acc);
         vsetvli(t0, s2, SEW::e32, LMUL::m2, VTA::ta, VMA::ma);
-        po_inj.compute_vector(24);
+        po_inj.compute_vector(24, rhs_dyn);
         vsetvli(t0, s2, SEW::e16, LMUL::m1, VTA::ta, VMA::ma);
         vfncvt_f_f_w(v_acc, VReg(24));
     }
@@ -1798,10 +1820,11 @@ void jit_uni_pool_interior_kernel_t<isa, d_type>::generate_nspc() {
     // kernel (n_blocks=0; every column goes through the channel-vec path), so
     // only eltwise chains reach here.
     post_ops_t no_po;
-    eltwise_injector::static_params_t esp(
-            VReg(12), VReg(16), VReg(20), fa4, fa5, t6, /*is_fwd=*/true);
+    eltwise_injector::static_params_t esp(VReg(12), VReg(16), VReg(20),
+            VReg(24), VReg(24), fa4, fa5, t6, /*is_fwd=*/true);
     injector::jit_uni_postops_injector_t<isa> po_inj(
             this, jpp_.fuse_eltwise ? jpp_.post_ops : no_po, esp);
+    binary_injector::rhs_arg_dynamic_params_t rhs_dyn; // eltwise-only here
 
     Label block_loop, block_done;
     L(block_loop);
@@ -1865,7 +1888,7 @@ void jit_uni_pool_interior_kernel_t<isa, d_type>::generate_nspc() {
     mv(a1, a5); // dst_ptr
     for (int j = 0; j < ur_w; j++) {
         if (!is_max) vfmul_vf(acc(j), acc(j), fa1);
-        if (jpp_.fuse_eltwise) po_inj.compute_vector(acc(j).getIdx());
+        if (jpp_.fuse_eltwise) po_inj.compute_vector(acc(j).getIdx(), rhs_dyn);
         vse32_v(acc(j), a1);
         if (j + 1 < ur_w) add(a1, a1, s5); // dst column stride == w_stride
     }

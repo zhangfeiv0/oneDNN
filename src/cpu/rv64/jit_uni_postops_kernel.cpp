@@ -42,9 +42,7 @@ struct jit_uni_postops_kernel_t::impl_t : public jit_generator_t {
         , po_(po)
         , with_bias_(with_bias)
         , bias_per_element_(bias_per_element)
-        , has_per_elem_binary_(has_per_elem_binary) {
-        create_kernel();
-    }
+        , has_per_elem_binary_(has_per_elem_binary) {}
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_uni_postops_kernel_t::impl_t)
 
@@ -60,7 +58,7 @@ struct jit_uni_postops_kernel_t::impl_t : public jit_generator_t {
         const Reg reg_len = a4;
         const Reg reg_vl = t0;
         const Reg reg_bytes = t1;
-        const Reg reg_off = t3; // byte offset of the chunk within the unit
+        const Reg reg_off = t3; // element offset of the chunk within the unit
         const Reg reg_gpr = t4; // binary injector scratch
 
         ld(reg_dst, reg_param, GET_OFF(dst));
@@ -73,15 +71,24 @@ struct jit_uni_postops_kernel_t::impl_t : public jit_generator_t {
         const VReg v_data(24);
         const VReg v_bias(20);
         const FReg f_bias = fa3;
-        eltwise_injector::static_params_t esp(
-                VReg(4), VReg(8), VReg(12), fa0, fa1, t2);
-        // Indirect binary rhs: reg_rhs is the pointer array, reg_off the shared
-        // per-chunk byte offset; each binary loads its own base + reg_off.
+        // 4 aux (v4/v8/v12 + v28) so log/soft_relu/gelu_erf post-ops fit; v28
+        // is the one free m4 group here (v16=binary rhs, v20=bias, v24=data).
+        eltwise_injector::static_params_t esp(VReg(4), VReg(8), VReg(12),
+                VReg(28), VReg(28), fa0, fa1, t2, /*is_fwd=*/true);
+        // Indirect binary rhs via the dynamic-params interface: reg_rhs is the
+        // per-binary pointer array; the injector computes each rhs address from
+        // the per-chunk output element offset (reg_off) it is handed at call
+        // time. reg_bytes is the injector's address scratch.
         binary_injector::static_params_t bsp(
-                VReg(16), fa2, reg_rhs, reg_off, reg_gpr);
+                VReg(16), fa2, reg_rhs, reg_bytes, reg_gpr);
         injector::jit_uni_postops_injector_t<v> inj(this, po_, esp, &bsp);
+        binary_injector::rhs_arg_dynamic_params_t rhs_dyn;
 
-        if (has_per_elem_binary_) ld(reg_off, reg_param, GET_OFF(off0));
+        if (has_per_elem_binary_) {
+            ld(reg_off, reg_param, GET_OFF(off0)); // byte offset
+            srli(reg_off, reg_off, 2); // -> element offset (rhs is f32)
+            rhs_dyn.vmm_idx_to_out_off[v_data.getIdx()] = reg_off;
+        }
 
         Label loop, done;
         L(loop);
@@ -101,7 +108,7 @@ struct jit_uni_postops_kernel_t::impl_t : public jit_generator_t {
             }
         }
 
-        inj.compute_vector(v_data.getIdx());
+        inj.compute_vector(v_data.getIdx(), rhs_dyn);
         vse32_v(v_data, reg_dst);
 
         slli(reg_bytes, reg_vl, 2);
@@ -110,7 +117,8 @@ struct jit_uni_postops_kernel_t::impl_t : public jit_generator_t {
         // advances likewise (each binary adds it to its own base). Scalars stay
         // fixed and ignore reg_off.
         if (with_bias_ && bias_per_element_) add(reg_bias, reg_bias, reg_bytes);
-        if (has_per_elem_binary_) add(reg_off, reg_off, reg_bytes);
+        if (has_per_elem_binary_)
+            add(reg_off, reg_off, reg_vl); // element offset
         sub(reg_len, reg_len, reg_vl);
         j_(loop);
 
@@ -171,7 +179,8 @@ bool jit_uni_postops_kernel_t::binary_per_last_dim_ok(
 
 bool jit_uni_postops_kernel_t::post_ops_supported(
         const post_ops_t &po, dim_t unit_nelems) {
-    return injector::jit_uni_postops_injector_t<v>::post_ops_ok(po)
+    return injector::jit_uni_postops_injector_t<v>::post_ops_ok(
+                   po, /*n_vaux=*/4)
             && binary_broadcast_ok(po, unit_nelems) && binary_rhs_dt_ok(po);
 }
 
@@ -179,7 +188,7 @@ status_t jit_uni_postops_kernel_t::create(
         std::shared_ptr<jit_uni_postops_kernel_t> &kernel, const post_ops_t &po,
         const conf_t &conf) {
     if (conf.dst_dt != data_type::f32) return status::unimplemented;
-    if (!injector::jit_uni_postops_injector_t<v>::post_ops_ok(po))
+    if (!injector::jit_uni_postops_injector_t<v>::post_ops_ok(po, /*n_vaux=*/4))
         return status::unimplemented;
     // The injector loads the binary rhs as f32 only (flw/vle32/vlse32).
     if (!binary_rhs_dt_ok(po)) return status::unimplemented;
@@ -196,6 +205,7 @@ status_t jit_uni_postops_kernel_t::create(
     std::shared_ptr<jit_uni_postops_kernel_t> k(new jit_uni_postops_kernel_t());
     k->impl_.reset(new impl_t(
             po, conf.with_bias, conf.bias_per_element, has_per_elem_binary));
+    CHECK(k->impl_->create_kernel());
     kernel = std::move(k);
     return status::success;
 }
