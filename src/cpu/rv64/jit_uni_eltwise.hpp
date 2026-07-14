@@ -37,10 +37,11 @@ namespace rv64 {
 
 // Standalone eltwise primitive: a thin VLA JIT wrapper around the RVV eltwise
 // injector (the same math used for fused post-ops), mirroring
-// aarch64/jit_uni_eltwise.cpp. Float-only (f32 / f16-zvfh); the kernel computes
-// in f32 and converts f16 at the load/store boundary. Integer eltwise
-// (s32/s8/u8) lives in the separate jit_uni_eltwise_int primitive, matching
-// x64/aarch64.
+// aarch64/jit_uni_eltwise.cpp. The kernel always computes in f32: f16 (zvfh
+// instance) is converted at the load/store boundary, and the integer dtypes
+// (s32/s8/u8, forward only, v instance) are widened to f32 on load and
+// saturated back to the dst range on store — the reference also evaluates
+// eltwise in float, so no separate integer primitive is needed.
 struct jit_uni_eltwise_fwd_kernel_t;
 struct jit_uni_eltwise_bwd_kernel_t;
 
@@ -65,12 +66,14 @@ struct jit_uni_eltwise_fwd_t : public primitive_t {
             const data_type_t d_type = dst_md()->data_type;
 
             // Runtime ISA dispatch (this primitive is pure JIT and registered
-            // via CPU_INSTANCE_RV64). Float-only: the zvfh instance owns f16,
-            // the v instance owns f32. Integer dtypes go to jit_uni_eltwise_int.
+            // via CPU_INSTANCE_RV64). The zvfh instance owns f16; the v
+            // instance owns f32 and the integer dtypes, which reuse the f32
+            // kernel through convert-on-load / saturate-on-store.
             VDISPATCH_ELTWISE(mayiuse(isa), VERBOSE_UNSUPPORTED_ISA);
             VDISPATCH_ELTWISE(is_fwd(), VERBOSE_BAD_PROPKIND);
-            const bool dt_ok
-                    = (isa == zvfh) ? (d_type == f16) : (d_type == f32);
+            const bool dt_ok = (isa == zvfh)
+                    ? (d_type == f16)
+                    : utils::one_of(d_type, f32, s32, s8, u8);
             VDISPATCH_ELTWISE(dt_ok, VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_ELTWISE(
                     src_md()->data_type == d_type, VERBOSE_UNSUPPORTED_DT);
@@ -95,11 +98,18 @@ struct jit_uni_eltwise_fwd_t : public primitive_t {
 
         bool use_dense_;
 
-        // Float-only. Forward exposes every alg the eltwise injector implements
-        // (the arithmetic ones, the exp()/log()-based transcendentals, and
-        // gelu_erf); the kernel feeds alg + alpha/beta straight to the injector.
-        // pow is not supported (like aarch64) -> ref.
+        // For the float dtypes, forward exposes every alg the eltwise injector
+        // implements (the arithmetic ones, the exp()/log()-based
+        // transcendentals, and gelu_erf); the kernel feeds alg + alpha/beta
+        // straight to the injector. The integer dtypes keep the x64/aarch64
+        // jit_uni_eltwise_int contract — relu/linear/clip, the algs that are
+        // well defined on integer data; other algs on integers -> ref. pow is
+        // not supported (like aarch64) -> ref.
         bool check_alg_kind() const {
+            if (utils::one_of(dst_md()->data_type, data_type::s32,
+                        data_type::s8, data_type::u8))
+                return utils::one_of(desc()->alg_kind, alg_kind::eltwise_relu,
+                        alg_kind::eltwise_linear, alg_kind::eltwise_clip);
             return eltwise_injector::is_fwd_alg_supported(desc()->alg_kind);
         }
     };

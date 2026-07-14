@@ -699,11 +699,17 @@ void jit_uni_eltwise_injector_t<isa>::compute_body(const Vmm &v) {
         case eltwise_sqrt: h_->vfsqrt_v(v, v); break;
 
         case eltwise_linear:
-            // alpha * x + beta
+            // alpha * x + beta, fused (single rounding): the reference build
+            // contracts this expression to fmadd.s (gcc -ffp-contract=fast)
+            // and the x64/aarch64 injectors use fused FMA too. The extra
+            // rounding of an unfused mul+add is observable once the f32
+            // result is converted to an integer dst (half-integer boundary,
+            // e.g. alpha*x+beta landing exactly on n+0.5 only because the
+            // product was pre-rounded).
             load_f32_const(f_aux0_, alpha_);
-            h_->vfmul_vf(v, v, f_aux0_);
             load_f32_const(f_aux1_, beta_);
-            h_->vfadd_vf(v, v, f_aux1_);
+            h_->vfmv_v_f(v_aux0_, f_aux1_);
+            h_->vfmadd_vf(v, f_aux0_, v_aux0_); // v = alpha * v + beta
             break;
 
         case eltwise_clip:

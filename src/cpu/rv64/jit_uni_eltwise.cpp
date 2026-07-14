@@ -14,6 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 #include <cstddef>
+#include <cstring>
 
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
@@ -35,20 +36,42 @@ namespace {
 
 // Emit one vector-length-agnostic pass: load `len` elements from a1 (and, for
 // backward, diff_dst from a3), convert to f32, run the injector, convert back,
-// store to a2. The injector always computes in f32; f16 is converted at the
-// load/store edge. This primitive is float-only — integer eltwise lives in
-// jit_uni_eltwise_int.
+// store to a2. The injector always computes in f32: f16 is converted at the
+// load/store edge, and the integer dtypes (s32/s8/u8, forward only) are
+// widened to f32 on load and saturated back to the dst range on store — the
+// reference also evaluates eltwise in float. RISC-V vfcvt.x.f saturates, so
+// the upper s32 clamp is max_value<f32>(s32) == 2147483520.f (2147483647.f is
+// not representable and rounds up to 2^31); the s8/u8 bounds are exact.
 //
 // Register layout: a1=in, a2=out, a3=diff_dst, a4=len, t0=vl, t1=bytes,
-// t2=gpr scratch; v4 = f32 compute group, v2 = f16 staging, v20 = diff_dst
-// (bwd), v8/v12/v16 = injector aux0..2, v0 = mask, fa0/fa1 = injector FP
-// scratch. The injector's 4th/5th aux (gelu_erf fwd, gelu_tanh bwd) are v20/v24
-// in forward (diff_dst absent) and v24/v28 in backward (v20 holds diff_dst).
+// t2=gpr scratch; v4 = f32 compute group, v2 = f16/int staging, v20 =
+// diff_dst (bwd), v8/v12/v16 = injector aux0..2, v0 = mask, fa0/fa1 =
+// injector FP scratch (fa0 is reused to materialize the integer saturation
+// bounds after the injector is done). The injector's 4th/5th aux (gelu_erf
+// fwd, gelu_tanh bwd) are v20/v24 in forward (diff_dst absent) and v24/v28 in
+// backward (v20 holds diff_dst). The compute LMUL is m1 for f32, m2 for f16
+// (e16/m1 widening pair), and m4 for s32 and s8/u8 (e8/m1 widening pair);
+// every group used (v4, v8, v12, v16, v20, v24) is 4-aligned, so the layout
+// is legal at each of these LMULs.
 void emit_eltwise_loop(jit_generator_t *h, alg_kind_t alg, float alpha,
         float beta, float scale, data_type_t dt, bool is_fwd) {
+    // Integer backward is rejected by the pd (matches x64, whose integer
+    // eltwise is forward-only).
+    assert(IMPLICATION(
+            !is_fwd, utils::one_of(dt, data_type::f32, data_type::f16)));
+
     const Reg p_in = a1, p_out = a2, p_dd = a3, len = a4, vl = t0, bytes = t1,
               gpr = t2;
     const VReg vd(4), vt(2), vdd(20);
+    const FReg fc = fa0;
+    // Materialize an f32 constant into fc (injector scratch, dead once
+    // compute_vector returns) for the integer saturation bounds.
+    auto setf = [&](float val) {
+        uint32_t bits;
+        std::memcpy(&bits, &val, sizeof(bits));
+        h->li(gpr, bits);
+        h->fmv_w_x(fc, gpr);
+    };
 
     const VReg v_aux3 = is_fwd ? VReg(20) : VReg(24);
     const VReg v_aux4 = is_fwd ? VReg(24) : VReg(28);
@@ -65,7 +88,7 @@ void emit_eltwise_loop(jit_generator_t *h, alg_kind_t alg, float alpha,
         h->vsetvli(vl, len, SEW::e32, LMUL::m1, VTA::ta, VMA::ma);
         h->vle32_v(vd, p_in);
         if (!is_fwd) h->vle32_v(vdd, p_dd);
-    } else { // f16
+    } else if (dt == data_type::f16) {
         h->vsetvli(vl, len, SEW::e16, LMUL::m1, VTA::ta, VMA::ma);
         h->vle16_v(vt, p_in);
         h->vfwcvt_f_f_v(vd, vt); // e16m1 -> e32m2
@@ -74,6 +97,23 @@ void emit_eltwise_loop(jit_generator_t *h, alg_kind_t alg, float alpha,
             h->vfwcvt_f_f_v(vdd, vt);
         }
         h->vsetvli(x0, vl, SEW::e32, LMUL::m2, VTA::ta, VMA::ma);
+    } else if (dt == data_type::s32) {
+        h->vsetvli(vl, len, SEW::e32, LMUL::m4, VTA::ta, VMA::ma);
+        h->vle32_v(vd, p_in);
+        h->vfcvt_f_x_v(vd, vd);
+    } else { // s8 / u8
+        h->vsetvli(vl, len, SEW::e8, LMUL::m1, VTA::ta, VMA::ma);
+        h->vle8_v(vt, p_in);
+        // vsext/vzext.vf4 operate at the destination vtype (e32/m4) and read
+        // the source group as 8-bit, so switch vtype before extending.
+        h->vsetvli(x0, vl, SEW::e32, LMUL::m4, VTA::ta, VMA::ma);
+        if (dt == data_type::s8) {
+            h->vsext_vf4(vd, vt);
+            h->vfcvt_f_x_v(vd, vd);
+        } else {
+            h->vzext_vf4(vd, vt);
+            h->vfcvt_f_xu_v(vd, vd);
+        }
     }
 
     // ---- compute (forward: alg(s); backward: alg'(s) * diff_dst) ----
@@ -83,16 +123,44 @@ void emit_eltwise_loop(jit_generator_t *h, alg_kind_t alg, float alpha,
     // ---- convert back + store (vtype currently e32 at the compute LMUL) ----
     if (dt == data_type::f32) {
         h->vse32_v(vd, p_out);
-    } else { // f16
+    } else if (dt == data_type::f16) {
         h->vsetvli(x0, vl, SEW::e16, LMUL::m1, VTA::ta, VMA::ma);
         h->vfncvt_f_f_w(vt, vd); // e32m2 -> e16m1
         h->vse16_v(vt, p_out);
+    } else if (dt == data_type::s32) {
+        setf(-2147483648.0f);
+        h->vfmax_vf(vd, vd, fc);
+        setf(2147483520.0f); // max_value<f32>(s32)
+        h->vfmin_vf(vd, vd, fc);
+        h->vfcvt_x_f_v(vd, vd);
+        h->vse32_v(vd, p_out);
+    } else { // s8 / u8
+        const bool is_s8 = dt == data_type::s8;
+        setf(is_s8 ? -128.0f : 0.0f);
+        h->vfmax_vf(vd, vd, fc);
+        setf(is_s8 ? 127.0f : 255.0f);
+        h->vfmin_vf(vd, vd, fc);
+        if (is_s8)
+            h->vfcvt_x_f_v(vd, vd);
+        else
+            h->vfcvt_xu_f_v(vd, vd);
+        // Narrow i32(m4) -> i16(m2) -> i8(m1) through vt; the second vnsrl
+        // overlaps its source in the lowest-numbered part of the group, which
+        // the narrowing overlap rule allows. Values are pre-clamped so the
+        // vnsrl-by-0 truncation is exact.
+        h->vsetvli(x0, vl, SEW::e16, LMUL::m2, VTA::ta, VMA::ma);
+        h->vnsrl_wi(vt, vd, 0);
+        h->vsetvli(x0, vl, SEW::e8, LMUL::m1, VTA::ta, VMA::ma);
+        h->vnsrl_wi(vt, vt, 0);
+        h->vse8_v(vt, p_out);
     }
 
     // ---- advance pointers by vl * sizeof(dtype) and loop ----
     const int dsz = static_cast<int>(types::data_type_size(dt));
-    const int sh = dsz == 4 ? 2 : 1; // f32 -> 2, f16 -> 1
-    h->slli(bytes, vl, sh);
+    if (dsz == 1) // s8 / u8
+        h->mv(bytes, vl);
+    else
+        h->slli(bytes, vl, dsz == 4 ? 2 : 1); // f32/s32 -> 2, f16 -> 1
     h->add(p_in, p_in, bytes);
     h->add(p_out, p_out, bytes);
     if (!is_fwd) h->add(p_dd, p_dd, bytes);
