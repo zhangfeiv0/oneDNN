@@ -349,11 +349,14 @@ void norm_kernel_t<isa, d_type>::generate() {
 
     // In-kernel post-op injector. Scratch is host-owned free vector/scalar regs;
     // binary uses indirect (rhs pointer array) scalar broadcast (off unused).
-    eltwise_injector::static_params_t esp(
-            VReg(16), VReg(20), VReg(24), fa4, fa5, t3, /*is_fwd=*/true);
+    eltwise_injector::static_params_t esp(VReg(16), VReg(20), VReg(24),
+            VReg(12), VReg(12), fa4, fa5, t3, /*is_fwd=*/true);
     binary_injector::static_params_t bsp(VReg(28), fa6, s4, x0, t4);
     injector::jit_uni_postops_injector_t<isa> po_inj(
             this, post_ops_, esp, with_binary_ ? &bsp : nullptr);
+    // gnorm binary post-ops are scalar (per_tensor) broadcast, so the dynamic
+    // rhs params carry no offset (the scalar path ignores it).
+    binary_injector::rhs_arg_dynamic_params_t rhs_dyn;
 
     const Reg reg_vl = t0, reg_tmp = t1, reg_tmp2 = t2;
     const Reg reg_runrem = a2, reg_rsrc = a3, reg_rdst = a4;
@@ -388,7 +391,7 @@ void norm_kernel_t<isa, d_type>::generate() {
             } else
                 vfadd_vf(v_dst, v_dst, ft3);
         }
-        if (with_postops_) po_inj.compute_vector(v_dst.getIdx());
+        if (with_postops_) po_inj.compute_vector(v_dst.getIdx(), rhs_dyn);
         if (!is_f16) {
             vse32_v(v_dst, reg_rdst);
         } else {
@@ -548,14 +551,15 @@ status_t jit_uni_group_normalization_fwd_t::pd_t::init(engine_t *engine) {
     VDISPATCH_GNORM(attr_.set_default_formats(dst_md(0)) == status::success,
             VERBOSE_UNSUPPORTED_POSTOP);
     const auto &po = attr()->post_ops_;
-    VDISPATCH_GNORM(injector::jit_uni_postops_injector_t<v>::post_ops_ok(po),
+    VDISPATCH_GNORM(injector::jit_uni_postops_injector_t<v>::post_ops_ok(
+                            po, /*n_vaux=*/4),
             VERBOSE_UNSUPPORTED_POSTOP);
     for (int i = 0; i < po.len(); i++) {
         if (!po.entry_[i].is_binary()) continue;
         const memory_desc_wrapper s1_d(po.entry_[i].binary.src1_desc);
-        // The in-kernel binary injector reads the rhs as f32 (flw/vle32) and the
-        // host advances it by sizeof(float); only a scalar (per_tensor) f32 src1
-        // is read correctly, so reject anything else (-> ncsp/ref).
+        // This host supplies only one shared output offset for the whole channel
+        // vector, so only a scalar (per_tensor) f32 src1 is addressable here;
+        // reject anything else (-> ncsp/ref).
         VDISPATCH_GNORM(
                 s1_d.nelems() == 1 && s1_d.data_type() == data_type::f32,
                 VERBOSE_UNSUPPORTED_POSTOP);

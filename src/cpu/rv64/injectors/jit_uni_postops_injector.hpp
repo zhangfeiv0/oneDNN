@@ -43,33 +43,54 @@ namespace injector {
 // eltwise ops plus any number of injector-supported binary ops. Each binary
 // reads its rhs from the pointer array carried in the (indirect) binary scratch,
 // indexed by its position among the chain's binaries — the x64/aarch64 scheme.
-// Comparison binaries, exotic broadcasts, sum and prelu are not covered — the
-// consumer pd rejects them so the framework selects a reference impl. The binary
-// scratch is optional: pass nullptr when the chain has no binary entry.
+// Exotic broadcasts, sum and prelu are not covered — the consumer pd rejects
+// them so the framework selects a reference impl. Binary select additionally
+// needs an independent condition scratch configuration and is enabled only by
+// the standalone binary host. The binary scratch is optional: pass nullptr when
+// the chain has no binary entry.
 template <cpu_isa_t isa>
 struct jit_uni_postops_injector_t {
     using Vmm = typename jit_isa_traits_t<isa>::Vmm;
 
+    // dst_md (optional): when provided, per-channel binary post-op rhs
+    // ([1, C, 1, ...]) is classified as per_oc and the injector computes the
+    // channel offset from the output offset at call time. Without it, binaries
+    // are scalar / per_element only.
     jit_uni_postops_injector_t(jit_generator_t *host,
             const post_ops_t &post_ops,
             const eltwise_injector::static_params_t &eltwise_static_params,
             const binary_injector::static_params_t *binary_static_params
+            = nullptr,
+            const memory_desc_t *dst_md = nullptr,
+            const binary_injector::static_params_t *select_static_params
             = nullptr);
 
-    // Apply the whole chain to the accumulator register group(s), identified by
-    // index (x64/aarch64 parity). Binary entries read their rhs from the
-    // host-positioned rhs pointer carried in binary_static_params.
-    void compute_vector(size_t idx) { compute_vector_range(idx, idx + 1); }
-    void compute_vector_range(size_t start_idx, size_t end_idx);
-    void compute_vector_range(const injector_utils::vmm_index_set_t &vmm_idxs);
+    // Apply the chain to the accumulator register group, identified by index
+    // (x64/aarch64 parity). Binary entries compute their rhs address from the
+    // per-register output offset in rhs_arg_params. entry_begin/entry_end select
+    // an entry sub-range so a host can apply the chain in pieces (e.g. around an
+    // in-kernel sum, which the injector skips); default is the whole chain.
+    void compute_vector(size_t idx,
+            const binary_injector::rhs_arg_dynamic_params_t &rhs_arg_params,
+            int entry_begin = 0, int entry_end = -1) {
+        compute_body(Vmm(idx), rhs_arg_params, entry_begin,
+                entry_end < 0 ? (int)post_ops_.len() : entry_end);
+    }
+    void compute_vector_range(size_t start_idx, size_t end_idx,
+            const binary_injector::rhs_arg_dynamic_params_t &rhs_arg_params);
 
     // True when every entry of `post_ops` can be injected in-kernel by this
     // injector: any number of supported forward eltwise ops, plus any number of
-    // supported binary ops.
-    static bool post_ops_ok(const post_ops_t &post_ops);
+    // supported binary ops. n_vaux is how many vector aux groups the host
+    // supplies to the eltwise static_params; the heavy eltwise algs (log/
+    // soft_relu/gelu_erf) require n_vaux >= 4.
+    static bool post_ops_ok(const post_ops_t &post_ops, int n_vaux = 3,
+            bool allow_binary_select = false);
 
 private:
-    void compute_body(const Vmm &v);
+    void compute_body(const Vmm &v,
+            const binary_injector::rhs_arg_dynamic_params_t &rhs_arg_params,
+            int entry_begin, int entry_end);
     jit_generator_t *const host_;
     post_ops_t post_ops_;
     std::vector<jit_uni_eltwise_injector_t<isa>> eltwise_injectors_;

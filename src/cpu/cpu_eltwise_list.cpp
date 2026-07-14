@@ -34,6 +34,7 @@ using namespace dnnl::impl::cpu::x64;
 using namespace dnnl::impl::cpu::aarch64;
 #elif DNNL_RV64
 #include "cpu/rv64/jit_uni_eltwise.hpp"
+#include "cpu/rv64/jit_uni_eltwise_int.hpp"
 using namespace dnnl::impl::cpu::rv64;
 #endif
 
@@ -70,6 +71,7 @@ const std::map<pk_impl_key_t, std::vector<impl_list_item_t>> &impl_list_map() {
             CPU_INSTANCE_AARCH64_ACL(acl_eltwise_fwd_t)
             CPU_INSTANCE_RV64(jit_uni_eltwise_fwd_t<v>)
             CPU_INSTANCE_RV64(jit_uni_eltwise_fwd_t<zvfh>)
+            CPU_INSTANCE_RV64(jit_uni_eltwise_int_fwd_t<v>)
             CPU_INSTANCE(ref_eltwise_fwd_t)
             nullptr,
         }},

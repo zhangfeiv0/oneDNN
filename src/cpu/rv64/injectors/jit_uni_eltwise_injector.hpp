@@ -38,6 +38,9 @@ namespace eltwise_injector {
 // vector scratch rather than the injector spilling. The injector may use v0 as
 // a mask register, so hosts must keep accumulator groups away from v0.
 struct static_params_t {
+    // Post-op / 3-aux form (all forward post-op consumers use this). v_aux3 and
+    // v_aux4 default to v_aux2: only algorithms gated to the standalone eltwise
+    // primitive (which supplies the wider form below) read them.
     static_params_t(const Xbyak_riscv::VReg &v_aux0,
             const Xbyak_riscv::VReg &v_aux1, const Xbyak_riscv::VReg &v_aux2,
             const Xbyak_riscv::FReg &f_aux0, const Xbyak_riscv::FReg &f_aux1,
@@ -45,28 +48,66 @@ struct static_params_t {
         : v_aux0(v_aux0)
         , v_aux1(v_aux1)
         , v_aux2(v_aux2)
+        , v_aux3(v_aux2)
+        , v_aux4(v_aux2)
         , f_aux0(f_aux0)
         , f_aux1(f_aux1)
         , gpr_aux0(gpr_aux0)
         , is_fwd(is_fwd) {}
 
-    // Up to three vector scratch groups (same LMUL as the host accumulator).
+    // Wide 5-aux form for the standalone eltwise primitive. The fourth group
+    // lets gelu_erf forward keep its input across erf; backward algorithms such
+    // as gelu_tanh use both the fourth and fifth groups. The backward injector is
+    // standalone-only, so widening it does not affect any post-op consumer.
+    static_params_t(const Xbyak_riscv::VReg &v_aux0,
+            const Xbyak_riscv::VReg &v_aux1, const Xbyak_riscv::VReg &v_aux2,
+            const Xbyak_riscv::VReg &v_aux3, const Xbyak_riscv::VReg &v_aux4,
+            const Xbyak_riscv::FReg &f_aux0, const Xbyak_riscv::FReg &f_aux1,
+            const Xbyak_riscv::Reg &gpr_aux0, bool is_fwd)
+        : v_aux0(v_aux0)
+        , v_aux1(v_aux1)
+        , v_aux2(v_aux2)
+        , v_aux3(v_aux3)
+        , v_aux4(v_aux4)
+        , f_aux0(f_aux0)
+        , f_aux1(f_aux1)
+        , gpr_aux0(gpr_aux0)
+        , is_fwd(is_fwd) {}
+
+    // Up to five vector scratch groups (same LMUL as the host accumulator).
     // Forward arithmetic algorithms use at most v_aux0; exp/logistic use
-    // v_aux0 and v_aux2; tanh/elu/swish/gelu_tanh use all three. Forward and
-    // backward may use v0 as a mask.
-    Xbyak_riscv::VReg v_aux0, v_aux1, v_aux2;
+    // v_aux0 and v_aux2; tanh/elu/swish/gelu_tanh/log/soft_relu/mish use all
+    // three; gelu_erf (fwd) additionally uses v_aux3, while some backward
+    // algorithms use both v_aux3 and v_aux4.
+    // Forward and backward may use v0 as a mask.
+    Xbyak_riscv::VReg v_aux0, v_aux1, v_aux2, v_aux3, v_aux4;
     Xbyak_riscv::FReg f_aux0, f_aux1; // two FP scratch regs for constants
     Xbyak_riscv::Reg gpr_aux0; // one GPR scratch for constant materialization
     // Forward (d = alg(s)) or backward (ds = alg'(s)).
     bool is_fwd;
 };
 
-// Whether the JIT eltwise injector can emit this algorithm. Covers arithmetic
-// forward algorithms plus the transcendentals built on the inline-coefficient
-// exp() primitive (exp/logistic/tanh/elu/swish/gelu_tanh).
-// Algorithms still needing log/erf (mish, gelu_erf, soft_relu, pow) are not yet
-// supported and fall back to a reference impl (the consumer pd rejects them).
+// Whether the JIT eltwise injector can emit this forward algorithm within the
+// 3-aux post-op budget. Covers the arithmetic algorithms, the exp()-based
+// transcendentals (exp/logistic/tanh/elu/swish/gelu_tanh), and mish/round.
+// log/soft_relu/gelu_erf need a 4th aux (see needs_extra_aux). pow is not
+// supported (like aarch64) and falls back to a reference impl.
 bool is_alg_supported(alg_kind_t alg);
+
+// Forward algorithms the standalone eltwise primitive accepts: everything in
+// is_alg_supported() plus the ones that need a 4th aux (see needs_extra_aux),
+// which the primitive supplies via the 5-aux static_params.
+bool is_fwd_alg_supported(alg_kind_t alg);
+
+// Forward algorithms outside the 3-aux budget: log/soft_relu/gelu_erf need a
+// 4th vector aux (v_aux3). A post-op consumer may enable them only when it
+// supplies that extra scratch (see the post_ops_ok n_vaux argument).
+bool needs_extra_aux(alg_kind_t alg);
+
+// Backward algorithms with an implemented derivative (src-based and
+// use-dst-based). The standalone eltwise backward primitive supplies the 5-aux
+// static_params these need.
+bool is_bwd_alg_supported(alg_kind_t alg);
 
 } // namespace eltwise_injector
 
@@ -92,10 +133,13 @@ struct jit_uni_eltwise_injector_t {
         , v_aux0_(sp.v_aux0)
         , v_aux1_(sp.v_aux1)
         , v_aux2_(sp.v_aux2)
+        , v_aux3_(sp.v_aux3)
+        , v_aux4_(sp.v_aux4)
         , f_aux0_(sp.f_aux0)
         , f_aux1_(sp.f_aux1)
         , gpr_aux0_(sp.gpr_aux0) {
-        assert(eltwise_injector::is_alg_supported(alg_));
+        assert(is_fwd_ ? eltwise_injector::is_fwd_alg_supported(alg_)
+                       : eltwise_injector::is_bwd_alg_supported(alg_));
     }
 
     jit_uni_eltwise_injector_t(jit_generator_t *host,
@@ -125,6 +169,17 @@ private:
     void exp_compute_vector(const Vmm &v);
     // sigmoid(v) = 1 / (1 + exp(-v)), in place. Uses the exp building block.
     void logistic_compute_vector(const Vmm &v);
+    // tanh(v) in place via 2*sigmoid(2v)-1 with a small-|v| linear blend. Uses
+    // v_aux0/v_aux1/v_aux2 (the full 3-aux budget). Building block for
+    // gelu_tanh and the tanh/gelu_tanh backward derivatives.
+    void tanh_compute_vector(const Vmm &v);
+    // log(v) in place: Cephes logf (frexp + degree-8 mantissa poly). Uses
+    // v_aux0 and v_aux2 plus v0 as a mask; leaves v_aux1 free.
+    void log_compute_vector(const Vmm &v);
+    // erf(v) in place: Abramowitz-Stegun 7.1.26 (t-poly * exp(-v^2)). Uses
+    // v_aux0/v_aux1/v_aux2 and v0; it leaves v_aux3/v_aux4 untouched for any
+    // values the caller must preserve.
+    void erf_compute_vector(const Vmm &v);
 
     const alg_kind_t alg_;
     const float alpha_;
@@ -136,6 +191,8 @@ private:
     const Xbyak_riscv::VReg v_aux0_;
     const Xbyak_riscv::VReg v_aux1_;
     const Xbyak_riscv::VReg v_aux2_;
+    const Xbyak_riscv::VReg v_aux3_;
+    const Xbyak_riscv::VReg v_aux4_;
     const Xbyak_riscv::FReg f_aux0_;
     const Xbyak_riscv::FReg f_aux1_;
     const Xbyak_riscv::Reg gpr_aux0_;
