@@ -308,7 +308,7 @@ status_t jit_uni_eltwise_fwd_t<isa>::pd_t::init(engine_t *engine) {
                                 data_type::u8)
             ? utils::one_of(desc_.alg_kind, alg_kind::eltwise_relu,
                       alg_kind::eltwise_linear, alg_kind::eltwise_clip)
-            : eltwise_injector::is_fwd_alg_supported(desc_.alg_kind);
+            : eltwise_injector::is_supported(desc_.alg_kind);
     VDISPATCH_ELTWISE(alg_ok, VERBOSE_BAD_ALGORITHM);
     // refer to a comment in jit_uni_kernel why this is needed
     VDISPATCH_ELTWISE(IMPLICATION(!src_d.is_dense(), is_zero_preserved()),
@@ -392,7 +392,7 @@ status_t jit_uni_eltwise_bwd_t<isa>::pd_t::init(engine_t *engine) {
     VDISPATCH_ELTWISE(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "data");
     VDISPATCH_ELTWISE(set_default_formats_common(), VERBOSE_UNSUPPORTED_TAG);
     VDISPATCH_ELTWISE(data_d.is_dense(true), VERBOSE_UNSUPPORTED_SPARSE_CFG);
-    VDISPATCH_ELTWISE(eltwise_injector::is_bwd_alg_supported(desc_.alg_kind),
+    VDISPATCH_ELTWISE(eltwise_injector::is_supported(desc_.alg_kind),
             VERBOSE_BAD_ALGORITHM);
     // refer to a comment in jit_uni_kernel why this is needed
     VDISPATCH_ELTWISE(IMPLICATION(!data_d.is_dense(), is_zero_preserved()),
