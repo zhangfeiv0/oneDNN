@@ -87,26 +87,33 @@ struct static_params_t {
     bool is_fwd;
 };
 
-// Whether the JIT eltwise injector can emit this forward algorithm within the
-// 3-aux post-op budget. Covers the arithmetic algorithms, the exp()-based
-// transcendentals (exp/logistic/tanh/elu/swish/gelu_tanh), and mish/round.
-// log/soft_relu/gelu_erf need a 4th aux (see needs_extra_aux). pow is not
-// supported (like aarch64) and falls back to a reference impl.
+/*
+ * Checks if a forward eltwise algorithm is supported by the eltwise injector
+ * within the base 3-aux scratch budget every post-op consumer provides.
+ * eltwise_pow is not supported (like aarch64) and falls back to a reference
+ * implementation.
+ */
 bool is_alg_supported(alg_kind_t alg);
 
-// Forward algorithms the standalone eltwise primitive accepts: everything in
-// is_alg_supported() plus the ones that need a 4th aux (see needs_extra_aux),
-// which the primitive supplies via the 5-aux static_params.
-bool is_fwd_alg_supported(alg_kind_t alg);
-
-// Forward algorithms outside the 3-aux budget: log/soft_relu/gelu_erf need a
-// 4th vector aux (v_aux3). A post-op consumer may enable them only when it
-// supplies that extra scratch (see the post_ops_ok n_vaux argument).
+/*
+ * Checks if a forward algorithm needs a 4th vector aux (v_aux3) on top of the
+ * base budget. A post-op consumer may enable such an algorithm only when it
+ * supplies that extra scratch (see the post_ops_ok n_vaux argument).
+ */
 bool needs_extra_aux(alg_kind_t alg);
 
-// Backward algorithms with an implemented derivative (src-based and
-// use-dst-based). The standalone eltwise backward primitive supplies the 5-aux
-// static_params these need.
+/*
+ * Checks if a forward algorithm is supported by the standalone eltwise
+ * primitive: everything in is_alg_supported() plus the algorithms needing the
+ * extra aux, which the primitive supplies via the 5-aux static_params_t.
+ */
+bool is_fwd_alg_supported(alg_kind_t alg);
+
+/*
+ * Checks if a backward algorithm (src-based or use-dst-based) has an
+ * implemented derivative. The standalone eltwise backward primitive supplies
+ * the 5-aux static_params_t these need.
+ */
 bool is_bwd_alg_supported(alg_kind_t alg);
 
 } // namespace eltwise_injector

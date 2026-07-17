@@ -16,6 +16,8 @@
 #include <cstring>
 #include <limits>
 
+#include "common/utils.hpp"
+
 #include "cpu/rv64/injectors/jit_uni_eltwise_injector.hpp"
 
 namespace dnnl {
@@ -29,37 +31,18 @@ namespace eltwise_injector {
 
 bool is_alg_supported(alg_kind_t alg) {
     using namespace alg_kind;
-    switch (alg) {
-        // arithmetic, table-free
-        case eltwise_relu:
-        case eltwise_square:
-        case eltwise_abs:
-        case eltwise_sqrt:
-        case eltwise_linear:
-        case eltwise_clip:
-        case eltwise_clip_v2:
-        case eltwise_hardsigmoid:
-        case eltwise_hardswish:
-        // transcendental, built on the inline-coefficient exp() primitive
-        case eltwise_exp:
-        case eltwise_logistic:
-        case eltwise_tanh:
-        case eltwise_elu:
-        case eltwise_swish:
-        case eltwise_gelu_tanh:
-        // built on the inline-coefficient log() primitive (3-aux form)
-        case eltwise_mish:
-        case eltwise_round: return true;
-        default: return false;
-    }
+    return utils::one_of(alg, eltwise_relu, eltwise_tanh, eltwise_elu,
+            eltwise_square, eltwise_abs, eltwise_sqrt, eltwise_linear,
+            eltwise_logistic, eltwise_mish, eltwise_exp, eltwise_gelu_tanh,
+            eltwise_hardsigmoid, eltwise_hardswish, eltwise_swish, eltwise_clip,
+            eltwise_clip_v2, eltwise_round);
 }
 
 bool needs_extra_aux(alg_kind_t alg) {
     using namespace alg_kind;
     // soft_relu (exp then log, keeping x live across both), log (keeps x live
     // across the poly to patch 0/inf/negative), gelu_erf (x live across erf).
-    return alg == eltwise_soft_relu || alg == eltwise_log
-            || alg == eltwise_gelu_erf;
+    return utils::one_of(alg, eltwise_soft_relu, eltwise_log, eltwise_gelu_erf);
 }
 
 bool is_fwd_alg_supported(alg_kind_t alg) {
@@ -70,37 +53,15 @@ bool is_fwd_alg_supported(alg_kind_t alg) {
 
 bool is_bwd_alg_supported(alg_kind_t alg) {
     using namespace alg_kind;
-    switch (alg) {
-        // src-based derivatives
-        case eltwise_relu:
-        case eltwise_square:
-        case eltwise_abs:
-        case eltwise_sqrt:
-        case eltwise_linear:
-        case eltwise_clip:
-        case eltwise_clip_v2:
-        case eltwise_hardsigmoid:
-        case eltwise_hardswish:
-        case eltwise_exp:
-        case eltwise_logistic:
-        case eltwise_tanh:
-        case eltwise_elu:
-        case eltwise_swish:
-        case eltwise_gelu_tanh:
-        case eltwise_log:
-        case eltwise_soft_relu:
-        case eltwise_mish:
-        case eltwise_gelu_erf:
-        // dst-based derivatives (alg'(s) expressed via the forward output d)
-        case eltwise_relu_use_dst_for_bwd:
-        case eltwise_tanh_use_dst_for_bwd:
-        case eltwise_elu_use_dst_for_bwd:
-        case eltwise_sqrt_use_dst_for_bwd:
-        case eltwise_logistic_use_dst_for_bwd:
-        case eltwise_exp_use_dst_for_bwd:
-        case eltwise_clip_v2_use_dst_for_bwd: return true;
-        default: return false;
-    }
+    return utils::one_of(alg, eltwise_relu, eltwise_tanh, eltwise_elu,
+            eltwise_square, eltwise_abs, eltwise_sqrt, eltwise_linear,
+            eltwise_soft_relu, eltwise_logistic, eltwise_mish, eltwise_exp,
+            eltwise_gelu_tanh, eltwise_hardsigmoid, eltwise_hardswish,
+            eltwise_swish, eltwise_log, eltwise_clip, eltwise_clip_v2,
+            eltwise_gelu_erf, eltwise_relu_use_dst_for_bwd,
+            eltwise_tanh_use_dst_for_bwd, eltwise_elu_use_dst_for_bwd,
+            eltwise_sqrt_use_dst_for_bwd, eltwise_logistic_use_dst_for_bwd,
+            eltwise_exp_use_dst_for_bwd, eltwise_clip_v2_use_dst_for_bwd);
 }
 
 } // namespace eltwise_injector
